@@ -207,8 +207,8 @@ export type TransportHandler = (message: TransportMessage) => void | Promise<voi
 
 export class TcpTransport {
   readonly #handlers = new Set<TransportHandler>();
-  #server?: Server;
-  #address?: NetworkAddress;
+  #server: Server | undefined;
+  #address: NetworkAddress | undefined;
 
   constructor(readonly options: { maxFrameBytes?: number; connectTimeoutMs?: number } = {}) {}
 
@@ -318,7 +318,7 @@ export class SecureTransport {
   }
 
   async send<T extends JsonValue>(address: NetworkAddress, topic: string, payload: T, recipient?: string): Promise<SignedEnvelope<T>> {
-    const envelope = this.identity.sign(topic, payload, { recipient });
+    const envelope = this.identity.sign(topic, payload, recipient === undefined ? {} : { recipient });
     await this.transport.send(address, Buffer.from(JSON.stringify(envelope), "utf8"));
     return envelope;
   }

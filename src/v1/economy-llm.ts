@@ -328,7 +328,12 @@ export class OpenAICompatibleProvider extends HttpLlmProvider {
     config: { baseUrl?: string; apiKey?: string; defaultModel: string; timeoutMs?: number; inputCostPerMillion?: number; outputCostPerMillion?: number },
     fetchImpl?: typeof fetch,
   ) {
-    super({ baseUrl: config.baseUrl ?? "https://api.openai.com/v1", apiKey: config.apiKey, defaultModel: config.defaultModel, timeoutMs: config.timeoutMs }, fetchImpl);
+    super({
+      baseUrl: config.baseUrl ?? "https://api.openai.com/v1",
+      defaultModel: config.defaultModel,
+      ...(config.apiKey === undefined ? {} : { apiKey: config.apiKey }),
+      ...(config.timeoutMs === undefined ? {} : { timeoutMs: config.timeoutMs }),
+    }, fetchImpl);
     this.estimatedInputCostPerMillion = config.inputCostPerMillion ?? 0;
     this.estimatedOutputCostPerMillion = config.outputCostPerMillion ?? 0;
   }
@@ -369,7 +374,12 @@ export class AnthropicProvider extends HttpLlmProvider {
     config: { apiKey: string; defaultModel: string; baseUrl?: string; timeoutMs?: number; inputCostPerMillion?: number; outputCostPerMillion?: number },
     fetchImpl?: typeof fetch,
   ) {
-    super({ baseUrl: config.baseUrl ?? "https://api.anthropic.com", apiKey: config.apiKey, defaultModel: config.defaultModel, timeoutMs: config.timeoutMs }, fetchImpl);
+    super({
+      baseUrl: config.baseUrl ?? "https://api.anthropic.com",
+      apiKey: config.apiKey,
+      defaultModel: config.defaultModel,
+      ...(config.timeoutMs === undefined ? {} : { timeoutMs: config.timeoutMs }),
+    }, fetchImpl);
     this.estimatedInputCostPerMillion = config.inputCostPerMillion ?? 0;
     this.estimatedOutputCostPerMillion = config.outputCostPerMillion ?? 0;
   }
@@ -409,7 +419,11 @@ export class OllamaProvider extends HttpLlmProvider {
   readonly estimatedOutputCostPerMillion = 0;
 
   constructor(config: { defaultModel: string; baseUrl?: string; timeoutMs?: number }, fetchImpl?: typeof fetch) {
-    super({ baseUrl: config.baseUrl ?? "http://127.0.0.1:11434", defaultModel: config.defaultModel, timeoutMs: config.timeoutMs }, fetchImpl);
+    super({
+      baseUrl: config.baseUrl ?? "http://127.0.0.1:11434",
+      defaultModel: config.defaultModel,
+      ...(config.timeoutMs === undefined ? {} : { timeoutMs: config.timeoutMs }),
+    }, fetchImpl);
   }
 
   protected async perform(request: LlmRequest, signal: AbortSignal): Promise<Omit<LlmResponse, "latencyMs">> {
