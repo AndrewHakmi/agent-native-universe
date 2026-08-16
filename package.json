@@ -1,15 +1,50 @@
 {
   "name": "agent-native-universe",
-  "version": "0.1.0",
-  "description": "A minimal agent-native computational substrate built from NanoAgent and LinkProtocol primitives.",
+  "version": "0.2.0",
+  "description": "An agent-native runtime where autonomous NanoAgents discover peers and evolve a graph through stateful adaptive LinkProtocols.",
   "type": "module",
-  "bin": {"anu": "./dist/cli/index.js"},
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "anu": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test test/*.test.mjs",
     "demo": "npm run build && node dist/examples/payment-network.js",
-    "check": "npm run build && npm test"
+    "check": "npm run build && npm test",
+    "demo:living": "npm run build && node dist/examples/living-network.js"
   },
-  "engines": {"node": ">=22"},
-  "license": "MIT"
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AndrewHakmi/agent-native-universe.git"
+  },
+  "keywords": [
+    "agents",
+    "multi-agent",
+    "agent-native",
+    "distributed-systems",
+    "emergent-architecture",
+    "protocols",
+    "runtime"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.3"
+  }
 }

@@ -1,4 +1,5 @@
 import { Universe } from "../runtime/universe.js";
+
 const objective = (primary: string) => ({ primary, secondary: ["minimize_cost", "maximize_evidence"], antiGoals: ["unsafe_external_write"], weights: { accuracy: 1, cost: -0.2, risk: -1 } });
 const u = new Universe();
 const validator = u.createAgent({ objective: objective("validate_invoice_state"), exposedState: { status: "ready" }, permissions: ["invoice.read"] });
