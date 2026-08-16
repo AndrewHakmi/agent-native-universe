@@ -1,0 +1,75 @@
+name: distributed-v1-finalize
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/v1-finalize.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Finalize public exports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/v1/index.ts')
+          text = path.read_text()
+          for line in [
+              'export * from "./identity-store.js";\n',
+              'export * from "./node-runner.js";\n',
+          ]:
+              if line not in text:
+                  text += line
+          path.write_text(text)
+          PY
+      - run: npm ci --ignore-scripts
+      - name: Build and execute the complete test universe
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm test | tee /tmp/anu-tests.log
+          grep -q '^# fail 0$' /tmp/anu-tests.log
+      - name: Persist validation evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          tests="$(awk '/^# tests / {value=$3} END {print value}' /tmp/anu-tests.log)"
+          if [ -z "$tests" ]; then
+            echo "Unable to determine test count"
+            exit 1
+          fi
+          mkdir -p validation
+          cat > validation/distributed-v1.json <<JSON
+          {
+            "sourceCommit": "${GITHUB_SHA}",
+            "node": "$(node --version)",
+            "status": "verified",
+            "tests": ${tests},
+            "failures": 0,
+            "verifiedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          JSON
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/v1/index.ts validation/distributed-v1.json
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "Release is already finalized"
+            exit 0
+          fi
+          git commit -m "Finalize and verify distributed v1 runtime"
+          git push origin HEAD:master
