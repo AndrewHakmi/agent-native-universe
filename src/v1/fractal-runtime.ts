@@ -171,7 +171,9 @@ export class FractalUniverse {
     }
     for (const agent of meta.internalAgents) {
       const current = this.#agents.get(agent.id);
-      this.#agents.set(agent.id, { ...(current ?? agent), parentMetaAgentId: undefined });
+      const restored = { ...(current ?? agent) };
+      delete restored.parentMetaAgentId;
+      this.#agents.set(agent.id, restored);
     }
     for (const link of meta.internalLinks) this.#links.set(link.id, structuredClone(link));
     this.#agents.delete(meta.id);

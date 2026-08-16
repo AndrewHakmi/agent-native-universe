@@ -1,217 +1,208 @@
 # Agent Native Universe
 
-**An agent-native runtime where architecture emerges from autonomous NanoAgents and the stateful protocols they negotiate with one another.**
+**An agent-native runtime where autonomous NanoAgents discover one another, negotiate stateful relationships, think through interchangeable LLM providers, pay for their own resource use, reach distributed agreement, and recursively organize into MetaAgents.**
 
-Agent Native Universe explores two computational primitives:
+The project is built around two primitives:
 
 - **NanoAgent** — a bounded local world with its own objective, state, capabilities, needs, policy, memory, budget and behavior.
-- **LinkProtocol** — a durable, adaptive relationship-state machine jointly controlled by two NanoAgents.
+- **LinkProtocol** — a durable, adaptive relationship jointly controlled by its participants.
 
-The project is not a manager-agent framework and not a conventional workflow engine. Its purpose is to remove the assumption that complex software must be organized around fixed services, central planners, human job roles and linear task pipelines.
-
-## Core law
+The graph is not merely a diagram of the system. **The live graph is the system.**
 
 > **Local sequential consistency. Global parallel evolution.**
 
-One `LinkProtocol` advances through ordered, revisioned turns. Independent links across the graph advance concurrently.
+## Runtime layers
+
+### Local living graph
+
+NanoAgents can:
+
+- advertise what they accept, produce and need;
+- discover useful peers;
+- accept, reject or counter relationship proposals;
+- expose only a negotiated boundary rather than private state;
+- synchronize LinkProtocols through alternating turns;
+- adapt communication frequency and payload shape from observed utility;
+- strengthen, weaken, sleep, reactivate and retire relationships;
+- clone, split and merge while preserving lineage.
+
+### Autonomous encrypted mesh
+
+The `agent-native-universe/autonomous` entrypoint adds the missing end-to-end connections:
+
+- live capability discovery across different processes and machines;
+- bilateral cross-machine relationship negotiation;
+- alternating remote boundary synchronization;
+- X25519 key agreement and AES-256-GCM payload encryption;
+- Ed25519 authentication and tamper detection;
+- replay protection and identity pinning;
+- real length-framed TCP transport.
+
+Plaintext agent state is not present in network frames.
+
+### Network Byzantine agreement
+
+Committee members keep their own private keys and exchange proposals and votes through the encrypted mesh.
+
+For `n` committee members the runtime tolerates:
 
 ```text
-NanoAgent <== stateful adaptive protocol ==> NanoAgent
-    |                                          |
-    +====== protocol ====== NanoAgent =========+
+f = floor((n - 1) / 3)
+quorum = 2f + 1
 ```
 
-The graph is not a diagram of the system. **The live graph is the system.**
+A leader cannot manufacture the other replicas' votes. Each replica independently validates and signs its decision. A commit certificate is applied only after a valid quorum, and view-change votes can move leadership after failure.
 
-## Living topology
+### Durable resource economy
 
-NanoAgents no longer need a caller to wire them together with `Universe.connect()`:
+The persistent economy tracks:
+
+- credits;
+- compute time;
+- model tokens;
+- storage;
+- bandwidth.
+
+Both sides of a market order are reserved immediately:
+
+- seller resources move into offer escrow;
+- buyer credits move into bid escrow;
+- price improvement is refunded;
+- trade resources and payment settle atomically;
+- cancellation and expiry return unused escrow;
+- balances, orders, trades and the journal survive restart.
+
+This prevents the same resource from being offered twice.
+
+### Metered LLM cognition
+
+`MeteredCognitiveLoop` makes an LLM invocation part of an agent's actual thought cycle.
+
+The runtime:
+
+1. serializes the agent's objective and local state;
+2. reserves model tokens and optional credits;
+3. routes the request through a provider-neutral completion interface;
+4. settles actual usage to the provider account;
+5. refunds unused reservation;
+6. applies validated private, exposed, durable and ephemeral state changes;
+7. dispatches requested actions through an explicit action handler.
+
+The existing OpenAI-compatible, Anthropic and Ollama adapters can be used through the same interface.
+
+### Continuous fractal organization
+
+Stable strongly connected clusters can be folded automatically into MetaAgents. Weak MetaAgent boundaries can be unfolded automatically.
+
+The controller supports:
+
+- stability windows before folding;
+- hysteresis before unfolding;
+- recursive higher-order MetaAgents;
+- deterministic MetaAgent identities;
+- optional BFT-gated fold and unfold operations.
+
+A cluster can therefore become one externally visible agent without losing its internal members, links, lineage or reversibility.
+
+## High-level composition
+
+`AutonomousMeshNode` connects the complete runtime:
 
 ```text
-publish capability boundary
-          ↓
-discover locally useful peers
-          ↓
-score compatibility from local needs
-          ↓
-propose complete protocol terms
-          ↓
-accept / counter / reject / defer
-          ↓
-probationary LinkProtocol
-          ↓
+local NanoAgents
+      ↓
+encrypted distributed discovery
+      ↓
+remote relationship negotiation
+      ↓
 alternating boundary synchronization
-          ↓
-strengthen / adapt / weaken / retire
+      ↓
+LLM cognition + automatic resource settlement
+      ↓
+network BFT for shared decisions
+      ↓
+persistent economy and graph-side effects
+      ↓
+continuous fractal MetaAgent formation
 ```
 
-Each node decides locally whom it considers useful. Each relationship is admitted bilaterally. The runtime supplies transport, causal ordering, pair isolation, logical time, hard invariants and failure containment—but it does not own a global product goal or secretly choose the architecture.
-
-## Implemented in v0.2
-
-### NanoAgent
-
-- stable identity, generation and lineage;
-- objectives, anti-goals and weighted preferences;
-- capabilities and explicit connection needs;
-- active, passive or disabled discovery policy;
-- private / exposed / durable / ephemeral state;
-- beliefs with confidence and uncertainty state;
-- commitments, permissions and resource budgets;
-- local candidate scoring and behavior hooks;
-- local offer acceptance, counteroffer, rejection or deferral;
-- boundary projection without exposing private state;
-- protocol adaptation proposals;
-- clone / split / merge / sleep / quarantine / retire;
-- deterministic runtime invariants.
-
-### LinkProtocol
-
-- negotiated shared boundary state;
-- field-level ownership;
-- strict alternating mutation rights;
-- atomic revisions with author, parent, evidence and mutation kind;
-- explicit empty-turn transfer instead of fabricated data;
-- payload modes: full state, structured, delta and event-only;
-- activation modes and communication budgets;
-- probation and evidence-based promotion;
-- information gain, utility, reliability, synchronization and cost metrics;
-- adaptive strength, decay and lifecycle;
-- bilateral protocol renegotiation;
-- contradiction preservation and consensus mutation support.
-
-### Living graph runtime
-
-- expiring decentralized capability advertisements;
-- autonomous peer discovery;
-- compatibility scoring from capabilities, needs, reciprocity and cost;
-- alternating formation and renegotiation handshakes;
-- rejection cooldowns and link-capacity limits;
-- concurrent advancement of independent links;
-- local failure containment;
-- automatic promotion, weakening, dormancy, heartbeat reactivation and retirement;
-- append-only topology events and negotiation transcripts;
-- emergent cluster detection;
-- constitutional authorization below model reasoning.
+The same encrypted transport carries discovery, relationship and committee traffic while each subsystem retains independent local failure containment.
 
 ## Quick start
 
 Requires Node.js 22 or newer.
 
 ```bash
-npm install
+npm ci
 npm run build
 npm test
 npm run demo:living
 ```
 
-The repository currently has zero runtime npm dependencies.
+The repository has zero runtime npm dependencies.
 
-## Autonomous example
+## Imports
 
 ```ts
 import { Universe } from "agent-native-universe";
 
-const objective = (primary: string) => ({
-  primary,
-  secondary: [],
-  antiGoals: ["unsafe_write"],
-  weights: { utility: 1, risk: -1 }
-});
+import {
+  DistributedGraphNode,
+  PersistentGraphStore,
+  ByzantineQuorum,
+  ResourceLedger,
+  LlmRouter,
+  FractalUniverse,
+} from "agent-native-universe/distributed";
 
-const universe = new Universe();
-
-const producer = universe.createAgent({
-  objective: objective("produce market signal"),
-  capabilities: [{
-    id: "market.sensor",
-    accepts: ["quality.feedback"],
-    produces: ["market.signal"],
-    riskClass: "low"
-  }],
-  exposedState: { signal: { velocity: 0.81 } }
-});
-
-const consumer = universe.createAgent({
-  objective: objective("detect opportunity"),
-  capabilities: [{
-    id: "opportunity.detector",
-    accepts: ["market.signal"],
-    produces: ["market.opportunity"],
-    riskClass: "low"
-  }],
-  needs: [{
-    id: "signal-input",
-    accepts: ["market.signal"],
-    priority: 1,
-    recurring: true,
-    maxCommunicationCost: 8,
-    minReliability: 0.5
-  }]
-});
-
-producer.activate();
-consumer.activate();
-
-const report = await universe.evolve({
-  rounds: 3,
-  maxLinkTurnsPerRound: 2
-});
-
-console.log(report.linksCreated);
-console.log(universe.projection());
+import {
+  AutonomousMeshNode,
+  MeshIdentity,
+  EncryptedTcpTransport,
+  DistributedDiscoveryMesh,
+  NetworkByzantineNode,
+  PersistentResourceEconomy,
+  MeteredCognitiveLoop,
+  CognitiveScheduler,
+  ContinuousMetaAgentController,
+} from "agent-native-universe/autonomous";
 ```
-
-No explicit connection is created. The agents advertise, discover, negotiate, enter probation, synchronize their boundaries and either prove the relationship useful or lose it.
 
 ## Runtime laws, not prompt requests
 
-A participant cannot:
+The deterministic runtime prevents a participant from:
 
-- commit twice in succession on a strict-alternation link;
-- modify a field owned by the counterparty;
-- unilaterally modify a consensus field;
-- exceed the negotiated communication budget;
-- mutate a retired or quarantined relationship;
-- silently rewrite relationship history.
+- writing twice in succession on a strict-alternation relationship;
+- changing fields owned by another participant;
+- silently rewriting relationship history;
+- accepting a forged or replayed encrypted message;
+- committing a committee decision without enough unique signatures;
+- spending a negative balance;
+- selling resources that have already been reserved;
+- consuming LLM resources without settlement;
+- folding unstable clusters immediately.
 
-These rules are enforced by deterministic TypeScript runtime code below any LLM or behavior adapter.
+## Repository map
 
-## Commands
-
-```bash
-npm run demo          # deterministic manually connected example
-npm run demo:living   # autonomous topology evolution
-npm test              # compile and execute all tests
-
-node dist/cli/index.js principles
-node dist/cli/index.js living
+```text
+src/core/       NanoAgent and LinkProtocol primitives
+src/runtime/    local living topology
+src/v1/         signed distributed graph, persistence, economy and provider adapters
+src/v2/         autonomous encrypted mesh and integrated runtime
+test/           deterministic, network and recovery tests
+docs/           architecture and operating semantics
 ```
-
-## Design constraints
-
-The following are intentionally **not** foundational primitives:
-
-- manager agents;
-- a central planner;
-- a global task queue;
-- globally mutable agent memory;
-- predefined microservices;
-- human job roles;
-- fixed workflows.
-
-They may still emerge as useful graph configurations. They are not imposed as universal laws.
 
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [LinkProtocol semantics](docs/PROTOCOL.md)
 - [Living graph runtime](docs/LIVING_GRAPH.md)
-
-## Next hard problems
-
-Distributed persistence, cryptographically verifiable provenance, leases and partitions, gossip, autonomous agent birth/death, resource markets, negotiated consensus fields, ephemeral arbitration agents, cluster compression, recursive/fractal agents, distributed scheduling and real model/tool adapters.
+- [Distributed v1](docs/DISTRIBUTED_V1.md)
+- [Multi-machine operation](docs/MULTI_MACHINE.md)
+- [Network BFT](docs/NETWORK_BFT.md)
+- [Autonomous encrypted mesh](docs/AUTONOMOUS_MESH.md)
 
 ## Status
 
-This is experimental infrastructure and a research-grade executable substrate, not yet a production security boundary. The current in-memory runtime makes the primitives testable before distributing them across processes and machines.
+This is a research-grade executable substrate. It now includes real encrypted networking, persistent recovery, distributed voting, durable resource settlement, metered cognition and continuous fractal organization. It is not yet a formally verified or independently audited production security boundary.

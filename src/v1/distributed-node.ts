@@ -161,7 +161,7 @@ export class DistributedGraphNode {
   readonly #commitHandlers = new Set<(state: DistributedRuntimeState, certificate: CommitCertificate) => void | Promise<void>>();
   #state: DistributedRuntimeState = structuredClone(EMPTY_STATE);
   #started = false;
-  #unsubscribe?: () => void;
+  #unsubscribe: (() => void) | undefined;
   #commitChain: Promise<void> = Promise.resolve();
 
   constructor(readonly config: DistributedNodeConfig) {
