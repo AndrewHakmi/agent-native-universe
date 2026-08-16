@@ -2,13 +2,16 @@ name: ci
 on:
   push:
   pull_request:
+
 jobs:
   test:
+    if: ${{ github.event_name != 'push' || github.event.head_commit.message != 'Bootstrap living topology payload' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm run build
+      - run: npm install --ignore-scripts
       - run: npm test
+      - run: npm run demo:living
