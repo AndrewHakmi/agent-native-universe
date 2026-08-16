@@ -24,10 +24,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          cp -a .github/workflows /tmp/anu-workflows
           cat .anu-bootstrap/archive.part-* | base64 -d > /tmp/agent-native-universe.tar.gz
           echo "f0a51aff7151c7450bae0ef3332439c0357032fb23ab3a8c4eeffdd894e1ec33  /tmp/agent-native-universe.tar.gz" | sha256sum -c -
           find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
           tar -xzf /tmp/agent-native-universe.tar.gz -C .
+          rm -rf .github/workflows
+          mkdir -p .github
+          cp -a /tmp/anu-workflows .github/workflows
       - name: Validate living topology runtime
         shell: bash
         run: |
@@ -43,6 +47,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
+          if git diff --cached --name-only | grep -q '^\.github/workflows/'; then
+            echo "Refusing to mutate workflows with the GitHub Actions token"
+            exit 1
+          fi
           git diff --cached --check
           git commit -m "Implement living agent topology"
           git push origin HEAD:master

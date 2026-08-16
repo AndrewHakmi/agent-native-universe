@@ -5,7 +5,7 @@ on:
 
 jobs:
   test:
-    if: ${{ github.event_name != 'push' || github.event.head_commit.message != 'Bootstrap living topology payload' }}
+    if: ${{ github.event_name != 'push' || (github.event.head_commit.message != 'Bootstrap living topology payload' && github.event.head_commit.message != 'Repair bootstrap publisher') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
