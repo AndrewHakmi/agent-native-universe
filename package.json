@@ -1,7 +1,7 @@
 {
   "name": "agent-native-universe",
   "version": "0.2.0",
-  "description": "An agent-native runtime where autonomous NanoAgents discover peers and evolve a graph through stateful adaptive LinkProtocols.",
+  "description": "A distributed agent-native runtime with signed TCP transport, persistent graph recovery, Byzantine quorum, resource economy, LLM routing and fractal metaagents.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -9,6 +9,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./distributed": {
+      "types": "./dist/distributed-v1.d.ts",
+      "import": "./dist/distributed-v1.js"
     }
   },
   "bin": {
@@ -38,6 +42,7 @@
     "multi-agent",
     "agent-native",
     "distributed-systems",
+    "byzantine-fault-tolerance",
     "emergent-architecture",
     "protocols",
     "runtime"
