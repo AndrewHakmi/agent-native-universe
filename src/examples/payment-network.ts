@@ -1,0 +1,10 @@
+import { Universe } from "../runtime/universe.js";
+const objective = (primary: string) => ({ primary, secondary: ["minimize_cost", "maximize_evidence"], antiGoals: ["unsafe_external_write"], weights: { accuracy: 1, cost: -0.2, risk: -1 } });
+const u = new Universe();
+const validator = u.createAgent({ objective: objective("validate_invoice_state"), exposedState: { status: "ready" }, permissions: ["invoice.read"] });
+const planner = u.createAgent({ objective: objective("plan_payment_retry"), exposedState: { status: "ready" }, permissions: ["retry.plan"] });
+validator.activate(); planner.activate();
+const link = u.connect({ left: validator.id, right: planner.id, fieldOwnership: { request: "left", response: "right", confidence: "either" }, mode: "strict_alternation", decayRate: 0.0000005 });
+link.mutate({ author: validator.id, delta: { request: { invoice: "inv_1", state: "failed" }, confidence: 0.99 }, informationGain: 0.9, utility: 0.8, communicationCost: 0.01 });
+link.mutate({ author: planner.id, delta: { response: { action: "retry", afterMs: 30000 }, confidence: 0.87 }, informationGain: 0.7, utility: 1, communicationCost: 0.02 });
+console.log(JSON.stringify({ universe: u.projection(), link: link.snapshot() }, null, 2));
