@@ -1,0 +1,312 @@
+name: metered-economy-upgrade
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/metered-economy-upgrade.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Materialize reservation-backed resource economy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > src/v1/metered-economy.ts <<'EOF'
+          import { randomUUID } from "node:crypto";
+          import {
+            ResourceLedger,
+            type LlmProvider,
+            type LlmRequest,
+            type LlmResponse,
+            type ResourceKind,
+          } from "./economy-llm.js";
+
+          export interface ReservedOffer {
+            id: string;
+            seller: string;
+            resource: Exclude<ResourceKind, "credits">;
+            remaining: number;
+            unitPrice: number;
+            minimumFill: number;
+            expiresAt: number;
+            escrowAccount: string;
+            status: "open" | "filled" | "cancelled";
+          }
+
+          export interface ReservedBid {
+            id: string;
+            buyer: string;
+            resource: Exclude<ResourceKind, "credits">;
+            remaining: number;
+            maxUnitPrice: number;
+            expiresAt: number;
+            escrowAccount: string;
+            status: "open" | "filled" | "cancelled";
+          }
+
+          export interface SettledResourceTrade {
+            id: string;
+            offerId: string;
+            bidId: string;
+            seller: string;
+            buyer: string;
+            resource: Exclude<ResourceKind, "credits">;
+            quantity: number;
+            unitPrice: number;
+            totalPrice: number;
+            settledAt: number;
+          }
+
+          export class ReservedResourceMarket {
+            readonly #offers = new Map<string, ReservedOffer>();
+            readonly #bids = new Map<string, ReservedBid>();
+            readonly #trades: SettledResourceTrade[] = [];
+
+            constructor(readonly ledger: ResourceLedger) {}
+
+            placeOffer(input: Omit<ReservedOffer, "id" | "escrowAccount" | "status" | "remaining"> & { quantity: number }): ReservedOffer {
+              validatePositive(input.quantity, "offer quantity");
+              validatePositive(input.unitPrice, "offer price");
+              if (!Number.isSafeInteger(input.minimumFill) || input.minimumFill <= 0 || input.minimumFill > input.quantity) throw new Error("Invalid minimum fill");
+              validateExpiry(input.expiresAt);
+              const id = randomUUID();
+              const escrowAccount = `@offer:${id}`;
+              this.ledger.transfer(input.seller, escrowAccount, input.resource, input.quantity, "reserve market offer", id);
+              const offer: ReservedOffer = { id, seller: input.seller, resource: input.resource, remaining: input.quantity, unitPrice: input.unitPrice, minimumFill: input.minimumFill, expiresAt: input.expiresAt, escrowAccount, status: "open" };
+              this.#offers.set(id, offer);
+              return structuredClone(offer);
+            }
+
+            placeBid(input: Omit<ReservedBid, "id" | "escrowAccount" | "status" | "remaining"> & { quantity: number }): ReservedBid {
+              validatePositive(input.quantity, "bid quantity");
+              validatePositive(input.maxUnitPrice, "maximum unit price");
+              validateExpiry(input.expiresAt);
+              const reservedCredits = multiplySafe(input.quantity, input.maxUnitPrice);
+              const id = randomUUID();
+              const escrowAccount = `@bid:${id}`;
+              this.ledger.transfer(input.buyer, escrowAccount, "credits", reservedCredits, "reserve market bid", id);
+              const bid: ReservedBid = { id, buyer: input.buyer, resource: input.resource, remaining: input.quantity, maxUnitPrice: input.maxUnitPrice, expiresAt: input.expiresAt, escrowAccount, status: "open" };
+              this.#bids.set(id, bid);
+              return structuredClone(bid);
+            }
+
+            match(now = Date.now()): SettledResourceTrade[] {
+              this.expire(now);
+              const created: SettledResourceTrade[] = [];
+              const bids = [...this.#bids.values()].filter((bid) => bid.status === "open").sort((a, b) => b.maxUnitPrice - a.maxUnitPrice || a.id.localeCompare(b.id));
+              const offers = [...this.#offers.values()].filter((offer) => offer.status === "open").sort((a, b) => a.unitPrice - b.unitPrice || a.id.localeCompare(b.id));
+              for (const bid of bids) {
+                for (const offer of offers) {
+                  if (bid.status !== "open" || offer.status !== "open") continue;
+                  if (bid.resource !== offer.resource || bid.maxUnitPrice < offer.unitPrice) continue;
+                  const quantity = Math.min(bid.remaining, offer.remaining);
+                  if (quantity < offer.minimumFill && quantity !== offer.remaining) continue;
+                  const totalPrice = multiplySafe(quantity, offer.unitPrice);
+                  const reservedForFill = multiplySafe(quantity, bid.maxUnitPrice);
+                  this.ledger.transfer(offer.escrowAccount, bid.buyer, offer.resource, quantity, "deliver reserved resource", offer.id);
+                  this.ledger.transfer(bid.escrowAccount, offer.seller, "credits", totalPrice, "settle reserved resource", bid.id);
+                  const priceImprovement = reservedForFill - totalPrice;
+                  if (priceImprovement > 0) this.ledger.transfer(bid.escrowAccount, bid.buyer, "credits", priceImprovement, "refund bid price improvement", bid.id);
+                  bid.remaining -= quantity;
+                  offer.remaining -= quantity;
+                  if (bid.remaining === 0) bid.status = "filled";
+                  if (offer.remaining === 0) offer.status = "filled";
+                  const trade: SettledResourceTrade = { id: randomUUID(), offerId: offer.id, bidId: bid.id, seller: offer.seller, buyer: bid.buyer, resource: offer.resource, quantity, unitPrice: offer.unitPrice, totalPrice, settledAt: now };
+                  this.#trades.push(trade);
+                  created.push(structuredClone(trade));
+                }
+              }
+              return created;
+            }
+
+            cancelOffer(id: string): ReservedOffer {
+              const offer = this.#offers.get(id);
+              if (!offer || offer.status !== "open") throw new Error(`Offer ${id} is not open`);
+              if (offer.remaining > 0) this.ledger.transfer(offer.escrowAccount, offer.seller, offer.resource, offer.remaining, "cancel reserved offer", id);
+              offer.remaining = 0;
+              offer.status = "cancelled";
+              return structuredClone(offer);
+            }
+
+            cancelBid(id: string): ReservedBid {
+              const bid = this.#bids.get(id);
+              if (!bid || bid.status !== "open") throw new Error(`Bid ${id} is not open`);
+              const refund = multiplySafe(bid.remaining, bid.maxUnitPrice);
+              if (refund > 0) this.ledger.transfer(bid.escrowAccount, bid.buyer, "credits", refund, "cancel reserved bid", id);
+              bid.remaining = 0;
+              bid.status = "cancelled";
+              return structuredClone(bid);
+            }
+
+            expire(now = Date.now()): void {
+              for (const offer of this.#offers.values()) if (offer.status === "open" && offer.expiresAt <= now) this.cancelOffer(offer.id);
+              for (const bid of this.#bids.values()) if (bid.status === "open" && bid.expiresAt <= now) this.cancelBid(bid.id);
+            }
+
+            trades(): SettledResourceTrade[] {
+              return this.#trades.map((trade) => structuredClone(trade));
+            }
+          }
+
+          export interface MeteredLlmOptions {
+            consumerAccount: string;
+            providerAccount: string;
+            reserveInputTokens?: (request: LlmRequest) => number;
+            reserveOutputTokens?: (request: LlmRequest) => number;
+          }
+
+          export class MeteredLlmProvider implements LlmProvider {
+            readonly id: string;
+            readonly capabilities: ReadonlySet<string>;
+            readonly estimatedInputCostPerMillion: number;
+            readonly estimatedOutputCostPerMillion: number;
+
+            constructor(readonly inner: LlmProvider, readonly ledger: ResourceLedger, readonly options: MeteredLlmOptions) {
+              this.id = `metered:${inner.id}`;
+              this.capabilities = inner.capabilities;
+              this.estimatedInputCostPerMillion = inner.estimatedInputCostPerMillion;
+              this.estimatedOutputCostPerMillion = inner.estimatedOutputCostPerMillion;
+            }
+
+            health(): ReturnType<LlmProvider["health"]> {
+              return this.inner.health();
+            }
+
+            async complete(request: LlmRequest, signal?: AbortSignal): Promise<LlmResponse> {
+              const reserveInput = this.options.reserveInputTokens?.(request) ?? estimateInputReserve(request);
+              const reserveOutput = this.options.reserveOutputTokens?.(request) ?? request.maxTokens ?? 1024;
+              validatePositive(reserveInput, "input token reserve");
+              validatePositive(reserveOutput, "output token reserve");
+              const reserved = reserveInput + reserveOutput;
+              if (!Number.isSafeInteger(reserved)) throw new Error("Token reservation exceeds safe integer range");
+              const escrow = `@llm:${randomUUID()}`;
+              this.ledger.transfer(this.options.consumerAccount, escrow, "model_tokens", reserved, "reserve LLM execution");
+              try {
+                const response = await this.inner.complete(request, signal);
+                const actual = response.usage.totalTokens;
+                if (!Number.isSafeInteger(actual) || actual < 0) throw new Error("Provider returned invalid token usage");
+                if (actual > reserved) this.ledger.transfer(this.options.consumerAccount, escrow, "model_tokens", actual - reserved, "extend LLM token reservation");
+                if (actual > 0) this.ledger.transfer(escrow, this.options.providerAccount, "model_tokens", actual, "settle LLM token usage");
+                const remaining = this.ledger.balance(escrow, "model_tokens");
+                if (remaining > 0) this.ledger.transfer(escrow, this.options.consumerAccount, "model_tokens", remaining, "refund unused LLM tokens");
+                return response;
+              } catch (error) {
+                const remaining = this.ledger.balance(escrow, "model_tokens");
+                if (remaining > 0) this.ledger.transfer(escrow, this.options.consumerAccount, "model_tokens", remaining, "refund failed LLM execution");
+                throw error;
+              }
+            }
+          }
+
+          function estimateInputReserve(request: LlmRequest): number {
+            const characters = request.messages.reduce((sum, message) => sum + message.content.length, 0);
+            return Math.max(1, Math.ceil(characters / 2) + request.messages.length * 16);
+          }
+
+          function validatePositive(value: number, label: string): void {
+            if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${label} must be a positive safe integer`);
+          }
+
+          function validateExpiry(expiresAt: number): void {
+            if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) throw new Error("Order is already expired");
+          }
+
+          function multiplySafe(left: number, right: number): number {
+            const value = left * right;
+            if (!Number.isSafeInteger(value)) throw new Error("Resource value exceeds safe integer range");
+            return value;
+          }
+          EOF
+          cat > test/metered-economy.test.mjs <<'EOF'
+          import test from "node:test";
+          import assert from "node:assert/strict";
+          import { MeteredLlmProvider, ReservedResourceMarket, ResourceLedger } from "../dist/v1/index.js";
+
+          test("market reservations prevent the same compute from being offered twice", () => {
+            const ledger = new ResourceLedger();
+            ledger.mint("seller", "compute_ms", 100);
+            const market = new ReservedResourceMarket(ledger);
+            market.placeOffer({ seller: "seller", resource: "compute_ms", quantity: 80, unitPrice: 2, minimumFill: 1, expiresAt: Date.now() + 60_000 });
+            assert.throws(() => market.placeOffer({ seller: "seller", resource: "compute_ms", quantity: 30, unitPrice: 2, minimumFill: 1, expiresAt: Date.now() + 60_000 }), /insufficient/);
+            assert.equal(ledger.balance("seller", "compute_ms"), 20);
+          });
+
+          test("reserved market settles resource and refunds bid price improvement", () => {
+            const ledger = new ResourceLedger();
+            ledger.mint("seller", "compute_ms", 100);
+            ledger.mint("buyer", "credits", 1_000);
+            const market = new ReservedResourceMarket(ledger);
+            market.placeOffer({ seller: "seller", resource: "compute_ms", quantity: 40, unitPrice: 2, minimumFill: 1, expiresAt: Date.now() + 60_000 });
+            market.placeBid({ buyer: "buyer", resource: "compute_ms", quantity: 20, maxUnitPrice: 3, expiresAt: Date.now() + 60_000 });
+            const [trade] = market.match();
+            assert.equal(trade.totalPrice, 40);
+            assert.equal(ledger.balance("buyer", "compute_ms"), 20);
+            assert.equal(ledger.balance("buyer", "credits"), 960);
+            assert.equal(ledger.balance("seller", "credits"), 40);
+          });
+
+          test("metered LLM execution escrows a hard token budget and refunds unused tokens", async () => {
+            const ledger = new ResourceLedger();
+            ledger.mint("agent", "model_tokens", 1_000);
+            const inner = { id: "fake", capabilities: new Set(["chat"]), estimatedInputCostPerMillion: 0, estimatedOutputCostPerMillion: 0, health: () => ({ healthy: true, consecutiveFailures: 0 }), complete: async () => ({ provider: "fake", model: "fake-model", content: "ok", usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 }, latencyMs: 1 }) };
+            const provider = new MeteredLlmProvider(inner, ledger, { consumerAccount: "agent", providerAccount: "provider", reserveInputTokens: () => 20, reserveOutputTokens: () => 30 });
+            const response = await provider.complete({ messages: [{ role: "user", content: "hello" }] });
+            assert.equal(response.content, "ok");
+            assert.equal(ledger.balance("agent", "model_tokens"), 985);
+            assert.equal(ledger.balance("provider", "model_tokens"), 15);
+          });
+
+          test("failed LLM execution refunds the entire reservation", async () => {
+            const ledger = new ResourceLedger();
+            ledger.mint("agent", "model_tokens", 100);
+            const inner = { id: "failed", capabilities: new Set(["chat"]), estimatedInputCostPerMillion: 0, estimatedOutputCostPerMillion: 0, health: () => ({ healthy: true, consecutiveFailures: 0 }), complete: async () => { throw new Error("provider unavailable"); } };
+            const provider = new MeteredLlmProvider(inner, ledger, { consumerAccount: "agent", providerAccount: "provider", reserveInputTokens: () => 20, reserveOutputTokens: () => 30 });
+            await assert.rejects(() => provider.complete({ messages: [{ role: "user", content: "hello" }] }), /unavailable/);
+            assert.equal(ledger.balance("agent", "model_tokens"), 100);
+            assert.equal(ledger.balance("provider", "model_tokens"), 0);
+          });
+          EOF
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src/v1/index.ts')
+          text = path.read_text()
+          line = 'export * from "./metered-economy.js";\n'
+          if line not in text:
+              text += line
+          path.write_text(text)
+          PY
+      - run: npm ci --ignore-scripts
+      - name: Verify reserved economy and metered LLM execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm test | tee /tmp/anu-metered-economy.log
+          grep -q '^# fail 0$' /tmp/anu-metered-economy.log
+      - name: Commit verified economic layer
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/v1/metered-economy.ts src/v1/index.ts test/metered-economy.test.mjs
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "Metered economy already current"
+            exit 0
+          fi
+          git commit -m "Implement reservation-backed agent resource economy"
+          git pull --rebase origin master
+          git push origin HEAD:master
