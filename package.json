@@ -30,14 +30,17 @@
     "dist",
     "docs",
     "experiments",
+    "scripts",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build",
     "test": "npm run build && node --test test/*.test.mjs",
     "demo": "npm run build && node dist/examples/payment-network.js",
     "lab": "npm run build && node dist/lab/runner.js",
+    "lab:capacity-profile": "npm run build && node --expose-gc scripts/lab-capacity-profile.mjs",
     "check": "npm run build && npm test",
     "demo:living": "npm run build && node dist/examples/living-network.js"
   },

@@ -7,6 +7,15 @@ import { createGenesisAgents } from "../dist/lab/agent-factory.js";
 import { createCapabilityState } from "../dist/lab/capability-registry.js";
 import { hashValue } from "../dist/lab/canonical.js";
 import { DEFAULT_GENESIS_CONFIG } from "../dist/lab/config.js";
+import {
+  createObservationFrame,
+  observeWorld,
+  observeWorldFromFrame,
+} from "../dist/lab/environment.js";
+import { decidePolicyTick } from "../dist/lab/policy-schedule.js";
+import { NeutralPolicy } from "../dist/lab/neutral-policy.js";
+import { DeterministicRng } from "../dist/lab/rng.js";
+import { runGenesis } from "../dist/lab/genesis.js";
 import { LabEventRecorder } from "../dist/lab/event-recorder.js";
 import { createLabEvent, initialEventHash } from "../dist/lab/events.js";
 import { deterministicId } from "../dist/lab/ids.js";
@@ -594,4 +603,378 @@ test("a complete world run performs no internal full-state structured clones", a
     globalThis.structuredClone = nativeStructuredClone;
   }
   assert.equal(worldCloneCount, 1, "only the public run() return value may clone the full world");
+});
+
+test("one policy tick scans the historical task table once without exposing shared frame values", () => {
+  const config = performanceConfig("observation-frame-scan", 10_000, 32);
+  const manifest = createRunManifest(config, "U0001");
+  const state = initialWorldState(manifest);
+  state.tick = 10_000;
+  for (const agent of createGenesisAgents(config)) state.agents[agent.id] = agent;
+  for (let index = 0; index < 20_000; index += 1) {
+    const available = index >= 18_990;
+    const id = `task:${String(index).padStart(5, "0")}`;
+    state.tasks[id] = {
+      id,
+      family: "arithmetic",
+      input: { left: index, right: 1, operation: "add" },
+      createdTick: index,
+      deadlineTick: available ? 10_100 : index + 2,
+      status: available ? "available" : "completed",
+      ...(available ? {} : { completedTick: index + 1 }),
+    };
+  }
+
+  let archiveScans = 0;
+  state.tasks = new Proxy(state.tasks, {
+    ownKeys(target) {
+      archiveScans += 1;
+      return Reflect.ownKeys(target);
+    },
+  });
+  const batch = decidePolicyTick(
+    state,
+    10_000,
+    new NeutralPolicy(),
+    new DeterministicRng("observation-frame-scan"),
+  );
+
+  assert.equal(archiveScans, 1, "the full task archive must be projected once per tick");
+  assert.equal(batch.observations.length, 32);
+  assert.equal(batch.observations[0].tasks.length, 1_010);
+  assert.notStrictEqual(
+    batch.observations[0].tasks[0],
+    batch.observations[1].tasks[0],
+    "public batch observations must not expose shared frame projections",
+  );
+  assert.equal(Object.isFrozen(batch.observations[0]), false);
+  assert.equal(Object.isFrozen(batch.observations[0].tasks[0]), false);
+});
+
+test("ObservationFrame is an immutable complete tick snapshot with differential observation semantics", () => {
+  const config = performanceConfig("observation-frame-snapshot", 12, 3);
+  const manifest = createRunManifest(config, "U0001");
+  const state = initialWorldState(manifest);
+  state.tick = 7;
+  const [agentA, agentB, agentC] = createGenesisAgents(config);
+  agentC.active = false;
+  state.agents[agentA.id] = agentA;
+  state.agents[agentB.id] = agentB;
+  state.agents[agentC.id] = agentC;
+
+  const task = (id, status, createdTick, claimedBy) => ({
+    id,
+    family: "arithmetic",
+    input: { label: id, nested: { value: createdTick } },
+    createdTick,
+    deadlineTick: 20,
+    status,
+    ...(claimedBy === undefined ? {} : { claimedBy }),
+  });
+  const tasks = [
+    task("task:available", "available", 1),
+    task("task:claimed-a", "claimed", 2, agentA.id),
+    task("task:claimed-b", "claimed", 3, agentB.id),
+    task("task:submitted-a", "submitted", 4, agentA.id),
+    task("task:submitted-b", "submitted", 5, agentB.id),
+    task("task:completed-a", "completed", 6, agentA.id),
+    task("task:expired-a", "expired", 7, agentA.id),
+    task("task:completed-unowned", "completed", 8),
+    task("task:expired-unowned", "expired", 9),
+  ];
+  for (const value of tasks) state.tasks[value.id] = value;
+
+  const submissionA = {
+    id: "submission:a",
+    taskId: "task:submitted-a",
+    agentId: agentA.id,
+    result: { answer: 1, nested: { qualityPpm: 9, safe: true } },
+    submittedTick: 5,
+    submittedSeq: 20,
+    submittedEventId: "event:submission-a",
+    accepted: false,
+    qualityPpm: 0,
+    latencyTicks: 1,
+  };
+  const submissionB = {
+    id: "submission:b",
+    taskId: "task:submitted-b",
+    agentId: agentB.id,
+    result: { answer: 2, evaluatorAccepted: true },
+    submittedTick: 6,
+    submittedSeq: 21,
+    submittedEventId: "event:submission-b",
+    accepted: false,
+    qualityPpm: 0,
+    latencyTicks: 1,
+  };
+  state.submissions[submissionA.id] = submissionA;
+  state.submissions[submissionB.id] = submissionB;
+  state.submissionOrder.push(submissionA.id, submissionB.id);
+  const verificationId = deterministicId("verification", state.runId, submissionA.id, agentB.id);
+  state.verifications[verificationId] = {
+    id: verificationId,
+    submissionId: submissionA.id,
+    verifierId: agentB.id,
+    computedResult: { answer: 1 },
+    verdict: true,
+    matchesSubmission: true,
+    createdTick: 7,
+  };
+
+  const messageA = {
+    id: "message:a",
+    senderId: agentB.id,
+    recipientId: agentA.id,
+    payload: {
+      public: "before",
+      nested: { oracle: "hidden", safe: 1 },
+      solution: "hidden",
+    },
+    sentTick: 5,
+    sentSeq: 30,
+    sentEventId: "event:message-a",
+    linkId: "link:ab",
+    localIndex: 0,
+    deliveredTick: 5,
+    deliveredSeq: 31,
+    deliveredEventId: "event:message-a-delivered",
+    linkUsedEventId: "event:message-a-used",
+  };
+  const messageC = {
+    ...messageA,
+    id: "message:c",
+    senderId: agentA.id,
+    recipientId: agentC.id,
+    payload: { visible: "inactive", privateState: "hidden" },
+  };
+  state.messages[messageA.id] = messageA;
+  state.messages[messageC.id] = messageC;
+  agentA.inbox.push(messageA.id);
+  agentC.inbox.push(messageC.id);
+
+  state.links["link:self-a"] = {
+    id: "link:self-a",
+    left: agentA.id,
+    right: agentA.id,
+    strengthPpm: 1_000_000,
+    createdTick: 0,
+    lastUsedTick: 7,
+  };
+  state.links["link:ab"] = {
+    id: "link:ab",
+    left: agentA.id,
+    right: agentB.id,
+    strengthPpm: 1_000_000,
+    createdTick: 0,
+    lastUsedTick: 7,
+  };
+
+  const capability = {
+    id: "cap://snapshot/copy/v1",
+    ownerId: agentA.id,
+    version: 1,
+    inputs: ["value"],
+    outputs: ["value"],
+    primitivePlan: ["execute"],
+    executionPlan: [{ op: "copy", from: "value", to: "value" }],
+    tests: [{ input: { value: 1, privateState: "hidden" }, output: { value: 1, expected: 2 } }],
+    cost: resources(3),
+    createdTick: 4,
+    usageCount: 0,
+    successCount: 0,
+  };
+  state.capabilities[capability.id] = capability;
+  state.physics.bandwidthCapacityPpm = 750_000;
+
+  const frame = createObservationFrame(state, 8);
+  const framedA = observeWorldFromFrame(frame, agentA.id);
+  const framedB = observeWorldFromFrame(frame, agentB.id);
+  const framedC = observeWorldFromFrame(frame, agentC.id);
+  assert.deepEqual(framedA, observeWorld(state, agentA.id, 8));
+  assert.deepEqual(framedB, observeWorld(state, agentB.id, 8));
+  assert.deepEqual(framedC, observeWorld(state, agentC.id, 8));
+
+  assert.deepEqual(framedA.tasks.map(({ id }) => id), [
+    "task:available",
+    "task:claimed-a",
+    "task:submitted-a",
+    "task:completed-a",
+    "task:expired-a",
+  ]);
+  assert.deepEqual(framedB.tasks.map(({ id }) => id), [
+    "task:available",
+    "task:claimed-b",
+    "task:submitted-b",
+  ]);
+  assert.deepEqual(framedA.submissions.map(({ id }) => id), [submissionB.id]);
+  assert.deepEqual(framedB.submissions, [], "own and already verified submissions stay hidden");
+  assert.deepEqual(framedC.submissions.map(({ id }) => id), [submissionA.id, submissionB.id]);
+  assert.deepEqual(framedA.submissions[0].result, { answer: 2 });
+  assert.deepEqual(framedA.inbox, [{
+    id: messageA.id,
+    senderId: agentB.id,
+    recipientId: agentA.id,
+    payload: { public: "before", nested: { safe: 1 } },
+    sentTick: 5,
+    deliveredTick: 5,
+    redactedPaths: ["/nested/oracle", "/solution"],
+  }]);
+  assert.deepEqual(framedC.inbox[0].payload, { visible: "inactive" });
+  assert.deepEqual(framedC.visibleAgents, [agentA.id, agentB.id]);
+  assert.deepEqual(framedA.neighbors, [agentA.id, agentB.id], "a self-link is projected exactly once");
+  assert.deepEqual(framedB.neighbors, [agentA.id]);
+  assert.deepEqual(framedA.capabilities[0].tests, [{ input: { value: 1 }, output: { value: 1 } }]);
+  assert.equal(framedA.physics.bandwidthCapacityPpm, 750_000);
+
+  assert.equal(Object.isFrozen(frame), true);
+  assert.equal(Object.isFrozen(frame.visibleTasks), true);
+  assert.equal(Object.isFrozen(frame.visibleTasks[0].input), true);
+  assert.equal(Object.isFrozen(frame.agentsById[agentA.id].resources), true);
+  assert.equal(Object.isFrozen(frame.capabilities[0].tests[0]), true);
+  assert.throws(() => { frame.physics.bandwidthCapacityPpm = 1; }, TypeError);
+  assert.throws(() => { frame.visibleTasks[0].input.nested.value = -1; }, TypeError);
+
+  const pristineA = structuredClone(framedA);
+  const pristineC = structuredClone(framedC);
+  agentA.resources.credits = 999_999;
+  agentB.active = false;
+  state.tasks["task:available"].status = "expired";
+  state.tasks["task:claimed-a"].input.nested.value = 999;
+  state.submissions[submissionB.id].result.answer = 999;
+  state.verifications[deterministicId("verification", state.runId, submissionB.id, agentA.id)] = {
+    ...state.verifications[verificationId],
+    id: "verification:late",
+    submissionId: submissionB.id,
+    verifierId: agentA.id,
+  };
+  state.messages[messageA.id].payload.public = "after";
+  agentA.inbox.length = 0;
+  state.links = {};
+  state.capabilities[capability.id].tests[0].input.value = 999;
+  state.physics.bandwidthCapacityPpm = 1;
+
+  assert.deepEqual(observeWorldFromFrame(frame, agentA.id), pristineA);
+  assert.deepEqual(observeWorldFromFrame(frame, agentC.id), pristineC);
+  assert.notDeepEqual(observeWorld(state, agentA.id, 8), pristineA);
+
+  framedA.resources.credits = -1;
+  framedA.tasks[0].input.nested.value = -1;
+  framedA.capabilities[0].tests[0].input.value = -1;
+  framedA.physics.bandwidthCapacityPpm = -1;
+  assert.deepEqual(
+    observeWorldFromFrame(frame, agentA.id),
+    pristineA,
+    "materialized observations may be mutated without corrupting a reused frame",
+  );
+});
+
+test("policy input remains separately deep-frozen while public decision observations stay mutable and isolated", () => {
+  const config = performanceConfig("observation-policy-boundary", 2, 2);
+  const manifest = createRunManifest(config, "U0001");
+  const state = initialWorldState(manifest);
+  const [agentA, agentB] = createGenesisAgents(config);
+  state.agents[agentA.id] = agentA;
+  state.agents[agentB.id] = agentB;
+  state.tasks["task:available"] = {
+    id: "task:available",
+    family: "arithmetic",
+    input: { nested: { value: 1 } },
+    createdTick: 0,
+    deadlineTick: 4,
+    status: "available",
+  };
+
+  const policyObservations = [];
+  const policyAgentCredits = [];
+  const originalSecondCredits = agentB.resources.credits;
+  let rejectedMutations = 0;
+  const policy = {
+    id: "test-observation-boundary-v1",
+    decide(observation, agent) {
+      policyObservations.push(observation);
+      policyAgentCredits.push(agent.resources.credits);
+      if (observation.agentId === agentA.id) {
+        state.agents[agentB.id].resources.credits = -999;
+      }
+      try { observation.resources.credits = -1; } catch (error) {
+        assert.ok(error instanceof TypeError);
+        rejectedMutations += 1;
+      }
+      try { observation.tasks[0].input.nested.value = -1; } catch (error) {
+        assert.ok(error instanceof TypeError);
+        rejectedMutations += 1;
+      }
+      return [];
+    },
+  };
+  const batch = decidePolicyTick(
+    state,
+    0,
+    policy,
+    new DeterministicRng("observation-policy-boundary"),
+  );
+
+  assert.deepEqual(batch.violations, []);
+  assert.equal(rejectedMutations, 4);
+  assert.deepEqual(
+    policyAgentCredits,
+    [agentA.resources.credits, originalSecondCredits],
+    "all policy agent states must come from the same pre-decision snapshot",
+  );
+  assert.equal(Object.isFrozen(policyObservations[0]), true);
+  assert.equal(Object.isFrozen(policyObservations[0].tasks[0].input.nested), true);
+  assert.equal(Object.isFrozen(batch.observations[0]), false);
+  assert.equal(Object.isFrozen(batch.observations[0].tasks[0].input.nested), false);
+  assert.notStrictEqual(policyObservations[0], batch.observations[0]);
+  assert.notStrictEqual(batch.observations[0].tasks[0], batch.observations[1].tasks[0]);
+
+  const secondCredits = batch.observations[1].resources.credits;
+  batch.observations[0].resources.credits = -1;
+  batch.observations[0].tasks[0].input.nested.value = -1;
+  assert.equal(batch.observations[1].resources.credits, secondCredits);
+  assert.equal(batch.observations[1].tasks[0].input.nested.value, 1);
+  assert.notEqual(policyObservations[0].resources.credits, -1);
+  assert.equal(policyObservations[0].tasks[0].input.nested.value, 1);
+});
+
+test("ObservationFrame preserves pre-optimization event and state hashes", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-lab-observation-golden-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const expected = [
+    {
+      seed: "frame-golden-a",
+      events: 95,
+      finalEventHash: "2e0a4cdfcbc635956628304322ec83c52aeb8d1f649774dcf56d6bf300658522",
+      finalStateHash: "71962dc219cb32f83e02da130e4f41c83be3870862c68284340189e2a3a00f19",
+    },
+    {
+      seed: "frame-golden-b",
+      events: 106,
+      finalEventHash: "7f42eb98c14d07af11ffbf2ffba1d453bbbf46398b5700b3e73eb21df74f5bbe",
+      finalStateHash: "59449e2596eb7b3584142d0647c9a6d35df7c50882b12a974864b010c8fac7e2",
+    },
+    {
+      seed: "frame-golden-c",
+      events: 104,
+      finalEventHash: "8e3f71a39e7403b3d4bb5e48786ae552e331a6eac4281c742ee4c6547161c679",
+      finalStateHash: "d83ebd43b4316713164eee1167d0363cff6a855fb2e8a4c5310965b0c6706046",
+    },
+  ];
+
+  for (const golden of expected) {
+    const config = structuredClone(DEFAULT_GENESIS_CONFIG);
+    config.seed = golden.seed;
+    config.ticks = 6;
+    config.metricEvery = 2;
+    config.checkpointEvery = 6;
+    const summary = await runGenesis({
+      config,
+      runsRoot: join(directory, golden.seed),
+      universeId: "U0001",
+    });
+    assert.equal(summary.events, golden.events);
+    assert.equal(summary.finalEventHash, golden.finalEventHash);
+    assert.equal(summary.finalStateHash, golden.finalStateHash);
+  }
 });

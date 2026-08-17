@@ -8,6 +8,10 @@ import { pathToFileURL } from "node:url";
 import { EvidenceStore } from "./artifacts.js";
 import { canonicalJson } from "./canonical.js";
 import { loadGenesisConfig, validateGenesisConfig } from "./config.js";
+import {
+  attestRunEvidence,
+  verifyRunEvidenceAttestation,
+} from "./evidence-attestation.js";
 import { runGenesis } from "./genesis.js";
 import { startObserverServer } from "./observer.js";
 import {
@@ -66,6 +70,16 @@ const REPLAY_OPTIONS = new Set([
   "until-tick",
   "universe-id",
 ]);
+const ATTEST_OPTIONS = new Set([
+  "data-dir",
+  "experiment",
+  "run-id",
+  "universe-id",
+]);
+const VERIFY_ATTESTATION_OPTIONS = new Set([
+  ...ATTEST_OPTIONS,
+  "expected",
+]);
 const SERVE_OPTIONS = new Set(["auth-token-file", "data-dir", "host", "port"]);
 
 interface JsonSink {
@@ -96,6 +110,8 @@ const HELP = {
     "genesis-1": "run one logical Genesis-1 universe",
     population: "run a bounded population of independent universes",
     replay: "replay one universe from its append-only evidence",
+    attest: "create or recover a deterministic final evidence attestation",
+    "verify-attestation": "verify evidence and an externally published commitment",
     serve: "serve read-only evidence HTTP endpoints",
   },
   commonRunOptions: {
@@ -109,6 +125,8 @@ const HELP = {
     "anu lab genesis-1 --data-dir ./runs --universe-id U0001",
     "anu lab population --data-dir ./runs --universes 32 --parallel 8",
     "anu lab replay --data-dir ./runs --universe-id U0001 [--run-id RUN_ID]",
+    "anu lab attest --data-dir ./runs --universe-id U0001 --run-id RUN_ID",
+    "anu lab verify-attestation --data-dir ./runs --universe-id U0001 --run-id RUN_ID --expected sha256:HASH",
     "anu lab serve --data-dir ./runs --host 0.0.0.0 --port 3000 [--auth-token-file PATH]",
   ],
 } as const;
@@ -149,6 +167,12 @@ export async function runLabCli(
         return 0;
       case "replay":
         await executeReplay(argv.slice(1), io);
+        return 0;
+      case "attest":
+        await executeAttest(argv.slice(1), io);
+        return 0;
+      case "verify-attestation":
+        await executeVerifyAttestation(argv.slice(1), io);
         return 0;
       case "serve":
         await executeServe(argv.slice(1), io);
@@ -258,6 +282,57 @@ async function executeReplay(argv: readonly string[], io: LabCliIo): Promise<voi
     manifest,
     replay,
   });
+}
+
+async function executeAttest(argv: readonly string[], io: LabCliIo): Promise<void> {
+  const options = parseOptions(argv, ATTEST_OPTIONS);
+  if (options.help) {
+    writeJson(io.stdout, {
+      command: "attest",
+      status: "ok",
+      usage: "anu lab attest [--data-dir PATH] [--experiment genesis-1] [--universe-id U0001] [--run-id RUN_ID]",
+    });
+    return;
+  }
+
+  const evidence = await openSelectedEvidence(options.values);
+  const attestation = await attestRunEvidence(evidence);
+  writeJson(io.stdout, {
+    command: "attest",
+    status: "completed",
+    attestation,
+  });
+}
+
+async function executeVerifyAttestation(argv: readonly string[], io: LabCliIo): Promise<void> {
+  const options = parseOptions(argv, VERIFY_ATTESTATION_OPTIONS);
+  if (options.help) {
+    writeJson(io.stdout, {
+      command: "verify-attestation",
+      status: "ok",
+      usage: "anu lab verify-attestation [--data-dir PATH] [--experiment genesis-1] [--universe-id U0001] [--run-id RUN_ID] --expected sha256:HASH",
+    });
+    return;
+  }
+
+  const expected = requiredSha256Commitment(options.values, "expected");
+  const evidence = await openSelectedEvidence(options.values);
+  const attestation = await verifyRunEvidenceAttestation(evidence, expected);
+  writeJson(io.stdout, {
+    command: "verify-attestation",
+    status: "verified",
+    attestation,
+  });
+}
+
+async function openSelectedEvidence(
+  options: ReadonlyMap<string, string>,
+): Promise<EvidenceStore> {
+  const runsRoot = optionPath(options, "data-dir", DEFAULT_DATA_DIR);
+  const experimentId = optionExperiment(options);
+  const universeId = optionUniverseId(options, "universe-id", DEFAULT_UNIVERSE_ID);
+  const runId = optionalRunId(options);
+  return EvidenceStore.openExisting(runsRoot, experimentId, universeId, runId);
 }
 
 async function executeServe(argv: readonly string[], io: LabCliIo): Promise<void> {
@@ -481,6 +556,18 @@ function optionalRunId(options: ReadonlyMap<string, string>): string | undefined
   if (value === undefined) return undefined;
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value) || value.includes("..")) {
     throw new CliUsageError("--run-id must be a safe evidence run identifier");
+  }
+  return value;
+}
+
+function requiredSha256Commitment(
+  options: ReadonlyMap<string, string>,
+  name: string,
+): string {
+  const value = options.get(name);
+  if (value === undefined) throw new CliUsageError(`Option --${name} is required`);
+  if (!/^sha256:[0-9a-f]{64}$/.test(value)) {
+    throw new CliUsageError(`--${name} must be sha256 followed by a lowercase 64-hex digest`);
   }
   return value;
 }

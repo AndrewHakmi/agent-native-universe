@@ -27,6 +27,9 @@ node dist/lab/runner.js serve --data-dir /data --port 3000
 node dist/lab/runner.js serve --data-dir /data --port 3000 \
   --auth-token-file /run/secrets/anu_lab_observer_token
 node dist/lab/runner.js run --data-dir /data --universes N --agents N --ticks N
+node dist/lab/runner.js attest --data-dir /data --universe-id U0001 --run-id RUN_ID
+node dist/lab/runner.js verify-attestation --data-dir /data \
+  --universe-id U0001 --run-id RUN_ID --expected sha256:HASH
 ```
 
 The server must bind to `0.0.0.0:3000` inside the container. `/healthz` reports
@@ -123,6 +126,24 @@ The standard Genesis path records events without retaining a second complete
 in-memory event array, then performs streaming replay that verifies the entire
 hash chain. Checkpoints still contain a complete projected world state, so short
 checkpoint intervals can cause substantial disk amplification.
+Reads of a single checkpoint are capped at 64 MiB to fail closed on corrupted
+or unexpectedly amplified artifacts; inspect checkpoint size before increasing
+agent/task scale beyond the reference configuration.
+
+Every normally completed run stores `attestations/final.json`. Copy its
+`commitment` to an independently controlled append-only or signed store; keeping
+the commitment only on the same Docker volume does not protect against a full
+volume rewrite. Verification always performs full semantic replay and compares
+the reconstructed summary and metrics before accepting `--expected`. All five
+trusted evidence inputs stay open through one fd-anchored snapshot. Pathname
+replacement cannot redirect reads after the files are opened, while metadata
+changes to those open artifacts during the pass fail closed.
+
+The target-shaped ObservationFrame microbenchmark and current storage envelope
+are documented in `docs/LAB_CAPACITY.md`. The optimization removes repeated
+historical task scans from each agent observation, but it does not change the
+capacity statement above: the full `32 × 64 × 10,000` population is not yet
+validated.
 
 New evidence is stored at
 `<data-dir>/<experiment>/<universe>/<run-id>/`. Replaying a universe with more
@@ -213,6 +234,12 @@ The HTTP page reader validates bounded JSON records, a final newline, and local
 sequence continuity around the selected page; it does not re-hash the complete
 prefix on every request. Run `anu lab replay` for authoritative full-chain and
 projection verification.
+
+Run detail responses include the optional final attestation alongside manifest
+and summary. `attestationStatus` is `missing`, `invalid`, or `self_consistent`;
+the last value validates only the canonical envelope and its self-commitment.
+The Observer does not independently replay it; use `anu lab verify-attestation`
+with an externally stored expected commitment as the semantic authority.
 
 Run discovery serves at most 1,000 uniquely addressed runs. If that bounded
 scan is incomplete it returns 503; if duplicate run IDs are present it returns

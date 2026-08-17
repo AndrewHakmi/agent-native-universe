@@ -1,6 +1,8 @@
 import { EvidenceConflictError, EvidenceStore } from "./artifacts.js";
 import { hashValue } from "./canonical.js";
 import { validateGenesisConfig } from "./config.js";
+import { createRunEvidenceAttestation } from "./evidence-attestation.js";
+import { writeFinalAttestationInternal } from "./evidence-attestation-storage.js";
 import { createRunManifest } from "./manifest.js";
 import { ReplayEngine, type ReplayResult } from "./replay.js";
 import {
@@ -59,6 +61,12 @@ export async function runGenesis(options: GenesisRunOptions): Promise<RunSummary
     assertReplayEquivalent(liveState, replay, config);
     const summary = await createSummary(evidence, manifest, config, replay);
     await evidence.writeSummary(summary);
+    await writeFinalAttestationInternal(evidence, createRunEvidenceAttestation(
+      manifest,
+      config,
+      summary,
+      replay.state.metrics,
+    ));
     await evidence.flush();
     return structuredClone(summary);
   } catch (error) {
@@ -92,6 +100,12 @@ async function recoverCompletedRun(
     throw new EvidenceConflictError("Stored summary does not match replayed evidence");
   }
   if (!stored) await evidence.writeSummary(reconstructed);
+  await writeFinalAttestationInternal(evidence, createRunEvidenceAttestation(
+    manifest,
+    config,
+    reconstructed,
+    replay.state.metrics,
+  ));
   await evidence.flush();
   return structuredClone(stored ?? reconstructed);
 }

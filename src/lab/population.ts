@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { EvidenceConflictError, EvidenceStore } from "./artifacts.js";
 import { canonicalJson, hashValue } from "./canonical.js";
 import { validateGenesisConfig } from "./config.js";
+import { verifyCompletedRunEvidence } from "./evidence-verifier.js";
 import {
   ensureNoSymlinkDirectoryHierarchy,
   openRegularFileNoFollow,
@@ -19,7 +20,6 @@ import {
   LAB_TASK_GENERATOR_ID,
   populationSeed,
 } from "./manifest.js";
-import { ReplayEngine } from "./replay.js";
 import {
   LAB_SCHEMA_VERSION,
   type GenesisConfig,
@@ -322,39 +322,15 @@ async function assertInjectedSummaryEvidence(
     expectedManifest.universeId,
     expectedManifest.runId,
   );
-  const manifest = await evidence.readManifest();
+  const verifiedEvidence = await verifyCompletedRunEvidence(evidence);
+  const { manifest, config, summary: verified } = verifiedEvidence;
   if (hashValue(manifest) !== hashValue(expectedManifest)) {
     throw new Error(`Injected runner evidence manifest mismatch for ${expectedManifest.universeId}`);
   }
-  const config = await evidence.readConfig();
   if (hashValue(config) !== hashValue(expectedConfig)) {
     throw new Error(`Injected runner evidence config mismatch for ${expectedManifest.universeId}`);
   }
 
-  const replay = await ReplayEngine.replayFile(evidence.eventsPath, manifest, config);
-  if (!replay.state.completed || replay.lastTick !== config.ticks) {
-    throw new Error(`Injected runner evidence is incomplete for ${expectedManifest.universeId}`);
-  }
-  const metrics = await evidence.readMetrics();
-  const latestMetrics = metrics.at(-1);
-  if (latestMetrics === undefined || hashValue(metrics) !== hashValue(replay.state.metrics)) {
-    throw new Error(`Injected runner metrics do not match evidence for ${expectedManifest.universeId}`);
-  }
-  const verified: RunSummary = {
-    schemaVersion: LAB_SCHEMA_VERSION,
-    runId: manifest.runId,
-    universeId: manifest.universeId,
-    seed: manifest.seed,
-    ticks: config.ticks,
-    events: replay.eventsApplied,
-    finalStateHash: replay.stateHash,
-    finalEventHash: replay.finalEventHash,
-    latestMetrics: structuredClone(latestMetrics),
-  };
-  const stored = await evidence.readSummary();
-  if (stored === undefined || hashValue(stored) !== hashValue(verified)) {
-    throw new Error(`Stored summary does not match verified evidence for ${manifest.universeId}`);
-  }
   if (hashValue(returned) !== hashValue(verified)) {
     throw new Error(`Injected runner summary does not match verified evidence for ${manifest.universeId}`);
   }

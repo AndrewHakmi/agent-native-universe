@@ -1,5 +1,5 @@
 import { compareCodeUnits } from "./canonical.js";
-import { observeWorld } from "./environment.js";
+import { createObservationFrame, observeWorldFromFrame } from "./environment.js";
 import type { NeutralPolicyRandomSource } from "./neutral-policy.js";
 import type {
   LabAgentState,
@@ -43,21 +43,23 @@ export function decidePolicyTick(
   policy: LogicalPolicy,
   policyRng: NeutralPolicyRandomSource,
 ): PolicyDecisionBatch {
-  const agentIds = Object.values(snapshot.agents)
-    .filter((agent) => agent.active)
-    .map((agent) => agent.id)
-    .sort(compareCodeUnits);
+  const frame = createObservationFrame(snapshot, tick);
+  const agentIds = [...frame.activeAgentIds].sort(compareCodeUnits);
+  const policyAgents = new Map(agentIds.map((agentId) => [
+    agentId,
+    deepFreeze(structuredClone(snapshot.agents[agentId]!)),
+  ]));
   const observations: Observation[] = [];
   const decisions: PolicyDecision[] = [];
   const violations: DeferredPolicyViolation[] = [];
 
   for (const agentId of agentIds) {
-    const observation = observeWorld(snapshot, agentId, tick);
-    observations.push(structuredClone(observation));
+    const observation = observeWorldFromFrame(frame, agentId);
+    observations.push(observation);
     try {
       const actions = policy.decide(
         deepFreeze(structuredClone(observation)),
-        deepFreeze(structuredClone(snapshot.agents[agentId]!)),
+        policyAgents.get(agentId)!,
         policyRng,
       );
       for (const [localIndex, action] of actions.entries()) {

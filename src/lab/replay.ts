@@ -1,5 +1,6 @@
+import type { FileHandle } from "node:fs/promises";
 import { hashValue } from "./canonical.js";
-import { iterateEventFile } from "./event-stream.js";
+import { iterateEventFile, iterateEventHandle } from "./event-stream.js";
 import {
   initialEventChainVerification,
   initialEventHash,
@@ -72,43 +73,62 @@ export class ReplayEngine {
     config: GenesisConfig,
     untilTick?: number,
   ): Promise<ReplayResult> {
-    assertLabManifestImplementation(manifest);
-    validateUntilTick(untilTick);
-    const protocol = new LabProtocolVerifier(manifest, config);
-    let verification = initialEventChainVerification(manifest);
-    const state = initialWorldState(manifest);
-    let outputState: WorldState | undefined;
-    let eventsApplied = 0;
-    let finalEventHash = initialEventHash(manifest);
-    let lastSeq = 0;
-
-    for await (const event of iterateEventFile(path)) {
-      verification = verifyNextEvent(event, manifest, verification);
-      if (untilTick !== undefined && event.tick > untilTick && outputState === undefined) {
-        outputState = structuredClone(state);
-      }
-      protocol.verifyNext(event, state);
-      applyWorldEventMutable(state, event);
-      if (untilTick === undefined || event.tick <= untilTick) {
-        eventsApplied += 1;
-        finalEventHash = event.hash;
-        lastSeq = event.seq;
-      }
-    }
-    protocol.finish();
-
-    const projected = outputState ?? state;
-    const digest = hashValue(projected);
-    return {
-      state: projected,
-      digest,
-      stateHash: digest,
-      finalEventHash,
-      eventsApplied,
-      lastSeq,
-      lastTick: projected.tick,
-    };
+    return replayEventStream(iterateEventFile(path), manifest, config, untilTick);
   }
+
+  /** Replay from an fd-held evidence snapshot without resolving the pathname again. */
+  static async replayHandle(
+    handle: FileHandle,
+    manifest: RunManifest,
+    config: GenesisConfig,
+    untilTick?: number,
+  ): Promise<ReplayResult> {
+    return replayEventStream(iterateEventHandle(handle), manifest, config, untilTick);
+  }
+}
+
+async function replayEventStream(
+  events: AsyncIterable<LabEvent>,
+  manifest: RunManifest,
+  config: GenesisConfig,
+  untilTick?: number,
+): Promise<ReplayResult> {
+  assertLabManifestImplementation(manifest);
+  validateUntilTick(untilTick);
+  const protocol = new LabProtocolVerifier(manifest, config);
+  let verification = initialEventChainVerification(manifest);
+  const state = initialWorldState(manifest);
+  let outputState: WorldState | undefined;
+  let eventsApplied = 0;
+  let finalEventHash = initialEventHash(manifest);
+  let lastSeq = 0;
+
+  for await (const event of events) {
+    verification = verifyNextEvent(event, manifest, verification);
+    if (untilTick !== undefined && event.tick > untilTick && outputState === undefined) {
+      outputState = structuredClone(state);
+    }
+    protocol.verifyNext(event, state);
+    applyWorldEventMutable(state, event);
+    if (untilTick === undefined || event.tick <= untilTick) {
+      eventsApplied += 1;
+      finalEventHash = event.hash;
+      lastSeq = event.seq;
+    }
+  }
+  protocol.finish();
+
+  const projected = outputState ?? state;
+  const digest = hashValue(projected);
+  return {
+    state: projected,
+    digest,
+    stateHash: digest,
+    finalEventHash,
+    eventsApplied,
+    lastSeq,
+    lastTick: projected.tick,
+  };
 }
 
 export function replayEvents(

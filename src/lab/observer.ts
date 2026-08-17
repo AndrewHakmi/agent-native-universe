@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { isUtf8 } from "node:buffer";
-import { lstat, open, readdir, realpath, type FileHandle } from "node:fs/promises";
+import { lstat, readdir, realpath, type FileHandle } from "node:fs/promises";
 import {
   createServer,
   type IncomingMessage,
@@ -10,7 +10,10 @@ import {
 } from "node:http";
 import { join, relative, resolve, sep } from "node:path";
 import { compareCodeUnits } from "./canonical.js";
+import { validateRunEvidenceAttestation } from "./evidence-attestation-schema.js";
+import { openRegularFileNoFollow } from "./event-stream.js";
 import { MAX_LAB_EVENT_BYTES } from "./events.js";
+import type { RunEvidenceAttestation } from "./types.js";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 8787;
@@ -57,6 +60,11 @@ interface RunDiscovery {
   ambiguous: boolean;
   records: RunRecord[];
   truncated: boolean;
+}
+
+interface OptionalAttestationArtifact {
+  attestation: RunEvidenceAttestation | null;
+  status: "invalid" | "missing" | "self_consistent";
 }
 
 interface EventFileIdentity {
@@ -402,10 +410,13 @@ async function handleRequest(
     const record = await findRun(root, runId);
     if (record === undefined) throw new ObserverHttpError(404, "run_not_found");
     const summary = await readOptionalJsonArtifact(record.directory, "summary.json", root);
+    const attestationResult = await readOptionalAttestationArtifact(record, root);
     sendJson(response, 200, {
       runId,
       manifest: record.manifest,
       summary,
+      attestation: attestationResult.attestation,
+      attestationStatus: attestationResult.status,
     });
     return;
   }
@@ -674,6 +685,45 @@ async function readOptionalJsonArtifact(
   }
 }
 
+async function readOptionalAttestationArtifact(
+  record: RunRecord,
+  root: string,
+): Promise<OptionalAttestationArtifact> {
+  let value: Record<string, unknown> | null;
+  try {
+    value = await readOptionalJsonArtifact(
+      record.directory,
+      "attestations/final.json",
+      root,
+    );
+  } catch (error) {
+    if (error instanceof ObserverHttpError && (error.status === 413 || error.status === 422)) {
+      return { attestation: null, status: "invalid" };
+    }
+    throw error;
+  }
+  if (value === null) return { attestation: null, status: "missing" };
+  try {
+    validateRunEvidenceAttestation(value);
+  } catch {
+    return { attestation: null, status: "invalid" };
+  }
+  const expectedSubject = {
+    experimentId: record.manifest.experimentId,
+    runId: record.runId,
+    universeId: record.manifest.universeId,
+    engineVersion: record.manifest.engineVersion,
+    policyId: record.manifest.policyId,
+    taskGeneratorId: record.manifest.taskGeneratorId,
+  };
+  if (Object.entries(expectedSubject).some(
+    ([key, expected]) => typeof expected !== "string" || value.subject[key as keyof typeof value.subject] !== expected,
+  )) {
+    return { attestation: null, status: "invalid" };
+  }
+  return { attestation: value, status: "self_consistent" };
+}
+
 async function readBoundedFile(
   directory: string,
   fileName: string,
@@ -703,19 +753,16 @@ async function readBoundedFile(
 }
 
 async function openSafeArtifact(directory: string, fileName: string, root: string) {
-  const candidate = join(directory, fileName);
-  const candidateInfo = await lstat(candidate);
-  if (candidateInfo.isSymbolicLink() || !candidateInfo.isFile()) {
+  const candidate = resolve(directory, fileName);
+  if (!isWithin(root, candidate) || !isWithin(directory, candidate)) {
     throw new ObserverHttpError(422, "invalid_artifact");
   }
-
-  const canonicalDirectory = await realpath(directory);
-  const canonicalFile = await realpath(candidate);
-  if (!isWithin(root, canonicalDirectory) || !isWithin(canonicalDirectory, canonicalFile)) {
+  try {
+    return await openRegularFileNoFollow(candidate, constants.O_RDONLY);
+  } catch (error) {
+    if (isMissingFile(error)) throw error;
     throw new ObserverHttpError(422, "invalid_artifact");
   }
-
-  return open(canonicalFile, constants.O_RDONLY | constants.O_NOFOLLOW);
 }
 
 async function readEventPage(

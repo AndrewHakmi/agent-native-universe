@@ -163,6 +163,15 @@ directory. Replay requires `--run-id` when more than one compatible run exists,
 rejects incompatible engine identities, and uses the stored config to regenerate
 the deterministic neutral-policy decision stream and complete terminal protocol
 rather than trusting hash-valid event semantics.
+Each completed run now also receives an immutable deterministic final
+attestation. Publishing its `sha256:` commitment in an independently controlled
+append-only system makes later full-evidence rewrites detectable; the local
+attestation file alone is not an external trust anchor.
+The policy hot path now builds one immutable, redacted per-tick observation
+snapshot instead of rescanning the complete historical task table for every
+active agent. Structural sharing stays internal, policy code receives an
+isolated deeply frozen observation clone, and golden regressions preserve the
+exact pre-optimization event and state hashes.
 The Observer keeps a bounded, sparse in-memory cursor index so high `after`
 cursors can be served from logs larger than 64 MiB without changing the public
 `after`/`limit` API. These changes reduce memory and scan pressure; they are not
@@ -177,6 +186,13 @@ Run a conservative local experiment and verify it by replay:
 npm run build
 node dist/lab/runner.js genesis-1 --data-dir ./runs --agents 16 --ticks 500
 node dist/lab/runner.js replay --data-dir ./runs --universe-id U0001
+
+# Publish the returned commitment outside the evidence host, then verify it:
+node dist/lab/runner.js attest \
+  --data-dir ./runs --universe-id U0001 --run-id '<RUN_ID>'
+node dist/lab/runner.js verify-attestation \
+  --data-dir ./runs --universe-id U0001 --run-id '<RUN_ID>' \
+  --expected 'sha256:<EXTERNALLY_PUBLISHED_HASH>'
 ```
 
 Run the full reference configuration explicitly:
@@ -195,6 +211,9 @@ not a completed live benchmark of 32 universes with 64 agents × 10,000 ticks.
 See [Universe Lab](docs/UNIVERSE_LAB.md) for the scientific boundary, evidence
 model, commands, and current logical-v1.1 limitations. See
 [Lab deployment](docs/LAB_DEPLOYMENT.md) for the hardened Docker/Traefik stand.
+See [Lab capacity](docs/LAB_CAPACITY.md) for the runnable current-checkout
+profile, explicitly historical baseline comparison, storage estimate, and
+remaining steps before the full population can be considered validated.
 
 ## Imports
 

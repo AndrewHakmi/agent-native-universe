@@ -140,12 +140,31 @@ historical engine.
 Checkpoints still serialize the complete projected world state. Frequent
 checkpoints can therefore amplify disk use even though event recording and
 replay no longer materialize the complete event log in memory.
+Manifest, config, summary, attestation, and metrics reads are bounded; an
+individual checkpoint above 64 MiB is rejected instead of being materialized
+into process memory. The reference configuration remains below that per-file
+guard, but larger experiments must validate checkpoint size explicitly.
 
 The chain makes accidental corruption, truncation, and ordinary tampering
-detectable. It is not an external signature or transparency log: an attacker
-with write access to every artifact could replace the manifest and recompute a
-new chain. Long-term evidence should anchor the final hash in an independently
-controlled signed store.
+detectable. Every completed run also receives the immutable canonical artifact
+`attestations/final.json`. It commits, with domain-separated SHA-256, to the
+manifest, config, full metrics history, reconstructed summary, terminal event
+hash, terminal state hash, tick, and sequence. `anu lab attest` independently
+performs strict semantic replay before creating or returning it.
+
+The local attestation is not itself an external signature or transparency log:
+an attacker with write access to every artifact could replace the manifest,
+recompute a new chain, and replace the local commitment. Publish the returned
+`runId + sha256:commitment` in an independently controlled append-only or signed
+store, then use `anu lab verify-attestation --expected ...` to detect rewrite or
+rollback. No timestamp, hostname, path, credential, or signature is included in
+the deterministic artifact.
+
+Verification opens manifest, config, events, metrics, and summary through one
+fd-anchored run directory, keeps those file handles for the complete replay,
+and fails closed if an opened artifact changes during the pass. This prevents a
+pathname swap from redirecting one phase of verification to a different file;
+it does not replace the independently published expected commitment.
 
 ## Resource physics and pressure
 
@@ -195,6 +214,17 @@ node dist/lab/runner.js replay \
   --universe-id U0001 \
   --run-id '<RUN_ID>'
 
+node dist/lab/runner.js attest \
+  --data-dir ./runs \
+  --universe-id U0001 \
+  --run-id '<RUN_ID>'
+
+node dist/lab/runner.js verify-attestation \
+  --data-dir ./runs \
+  --universe-id U0001 \
+  --run-id '<RUN_ID>' \
+  --expected 'sha256:<EXTERNALLY_PUBLISHED_HASH>'
+
 node dist/lab/runner.js serve --data-dir ./runs --host 0.0.0.0 --port 3000
 
 # Application auth for a shared or public network:
@@ -208,8 +238,23 @@ Under the Compose 2 GB memory ceiling, population parallelism 2 is a starting
 engineering estimate pending a live full-population benchmark; it is not a
 validated capacity guarantee.
 
+The policy scheduler now creates one immutable, redacted per-tick observation
+snapshot. Structural sharing stays internal, while policy code receives an
+isolated deeply frozen observation clone. A historical one-off baseline at
+commit `926ab5f6a8c6c189c43eb882d09788832a08f113` measured about 1,127 ms for
+the target-shaped tick-10,000 policy sample; the current profile measured about
+279 ms, with an immediate repeat at 283 ms, while preserving exact historical
+event/state hashes. The checked-in
+command reproduces only the current profile, not that historical baseline or
+the derived ratio. This microbenchmark excludes reducer work, event I/O,
+checkpoints, replay, and process scheduling; it is not full-capacity proof. See
+`docs/LAB_CAPACITY.md` for the method and remaining bottlenecks.
+
 The observer exposes only read methods: health, readiness, the run catalogue,
-run summaries, and paginated events. Event pagination remains
+run summaries/final attestations, and paginated events. Run detail labels the
+optional attestation as `missing`, `invalid`, or `self_consistent`; only the CLI
+with an external expected commitment performs authoritative semantic
+verification. Event pagination remains
 `GET /api/runs/:runId/events?after=<seq>&limit=<count>`. A bounded sparse cursor
 index lets the process seek into logs larger than the 64 MiB per-request scan
 budget instead of repeatedly scanning from byte zero. The index is in-memory,

@@ -46,53 +46,59 @@ export interface AnchoredDirectory {
  */
 export async function* iterateEventFile(path: string): AsyncGenerator<LabEvent> {
   const handle = await openRegularFileNoFollow(path, constants.O_RDONLY);
-  let pending = Buffer.alloc(0);
-  let lineNumber = 0;
   try {
-    const stream = handle.createReadStream({
-      autoClose: false,
-      highWaterMark: 65_536,
-    });
-    for await (const chunk of stream) {
-      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-      pending = pending.length === 0 ? bytes : Buffer.concat([pending, bytes]);
-      let newline = pending.indexOf(0x0a);
-      while (newline >= 0) {
-        const lineBytes = pending.subarray(0, newline);
-        pending = pending.subarray(newline + 1);
-        lineNumber += 1;
-        if (lineBytes.length === 0) {
-          throw new EventChainError(`Event log contains a blank line at ${lineNumber}`);
-        }
-        if (lineBytes.length > MAX_LAB_EVENT_BYTES) {
-          throw new EventChainError(`Event log line ${lineNumber} exceeds the streaming safety limit`);
-        }
-        if (!isUtf8(lineBytes)) {
-          throw new EventChainError(`Event log line ${lineNumber} is not valid UTF-8`);
-        }
-        const line = lineBytes.toString("utf8");
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(line) as unknown;
-        } catch (error) {
-          throw new EventChainError(`Invalid JSON at event log line ${lineNumber}: ${errorMessage(error)}`);
-        }
-        validateLabEvent(parsed);
-        if (canonicalJson(parsed) !== line) {
-          throw new EventChainError(`Event log line ${lineNumber} is not canonical JSON`);
-        }
-        yield parsed;
-        newline = pending.indexOf(0x0a);
-      }
-      if (pending.length > MAX_LAB_EVENT_BYTES) {
-        throw new EventChainError(`Event log line ${lineNumber + 1} exceeds the streaming safety limit`);
-      }
-    }
-    if (pending.length > 0) {
-      throw new EventChainError("Event log is truncated: final JSONL newline is missing");
-    }
+    yield* iterateEventHandle(handle);
   } finally {
     await handle.close();
+  }
+}
+
+/** Iterate canonical events from an already-open snapshot handle without closing it. */
+export async function* iterateEventHandle(handle: FileHandle): AsyncGenerator<LabEvent> {
+  let pending = Buffer.alloc(0);
+  let lineNumber = 0;
+  const stream = handle.createReadStream({
+    autoClose: false,
+    highWaterMark: 65_536,
+    start: 0,
+  });
+  for await (const chunk of stream) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    pending = pending.length === 0 ? bytes : Buffer.concat([pending, bytes]);
+    let newline = pending.indexOf(0x0a);
+    while (newline >= 0) {
+      const lineBytes = pending.subarray(0, newline);
+      pending = pending.subarray(newline + 1);
+      lineNumber += 1;
+      if (lineBytes.length === 0) {
+        throw new EventChainError(`Event log contains a blank line at ${lineNumber}`);
+      }
+      if (lineBytes.length > MAX_LAB_EVENT_BYTES) {
+        throw new EventChainError(`Event log line ${lineNumber} exceeds the streaming safety limit`);
+      }
+      if (!isUtf8(lineBytes)) {
+        throw new EventChainError(`Event log line ${lineNumber} is not valid UTF-8`);
+      }
+      const line = lineBytes.toString("utf8");
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(line) as unknown;
+      } catch (error) {
+        throw new EventChainError(`Invalid JSON at event log line ${lineNumber}: ${errorMessage(error)}`);
+      }
+      validateLabEvent(parsed);
+      if (canonicalJson(parsed) !== line) {
+        throw new EventChainError(`Event log line ${lineNumber} is not canonical JSON`);
+      }
+      yield parsed;
+      newline = pending.indexOf(0x0a);
+    }
+    if (pending.length > MAX_LAB_EVENT_BYTES) {
+      throw new EventChainError(`Event log line ${lineNumber + 1} exceeds the streaming safety limit`);
+    }
+  }
+  if (pending.length > 0) {
+    throw new EventChainError("Event log is truncated: final JSONL newline is missing");
   }
 }
 

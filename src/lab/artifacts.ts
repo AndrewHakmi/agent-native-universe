@@ -5,9 +5,17 @@ import {
   opendir,
   readdir,
   unlink,
+  type FileHandle,
 } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { canonicalJson, hashValue } from "./canonical.js";
+import { validateGenesisConfig } from "./config.js";
+import { validateRunEvidenceAttestation } from "./evidence-attestation-schema.js";
+import { registerFinalAttestationWriter } from "./evidence-attestation-storage.js";
+import {
+  registerEvidenceVerificationSnapshotProvider,
+  type EvidenceVerificationSnapshot,
+} from "./evidence-verification-snapshot.js";
 import { LabEventRecorder } from "./event-recorder.js";
 import {
   ensureNoSymlinkDirectoryHierarchy,
@@ -20,10 +28,12 @@ import {
 import {
   assertLabManifestImplementation,
 } from "./manifest.js";
+import { ReplayEngine } from "./replay.js";
 import type {
   Checkpoint,
   GenesisConfig,
   MetricsSnapshot,
+  RunEvidenceAttestation,
   RunManifest,
   RunSummary,
 } from "./types.js";
@@ -37,6 +47,11 @@ export class EvidenceConflictError extends Error {
 
 const MAX_DISCOVERY_ENTRIES = 10_000;
 const MAX_MANIFEST_BYTES = 1_048_576;
+const MAX_CONFIG_BYTES = 1_048_576;
+const MAX_SUMMARY_BYTES = 1_048_576;
+const MAX_METRICS_BYTES = 67_108_864;
+const MAX_CHECKPOINT_BYTES = 67_108_864;
+const MAX_ATTESTATION_BYTES = 1_048_576;
 
 export interface EvidenceStoreOptions {
   /** Retain the full event log for synchronous inspection. Disable for long runs. */
@@ -60,11 +75,13 @@ export class EvidenceStore {
   readonly runId: string | undefined;
   readonly directory: string;
   readonly checkpointsDirectory: string;
+  readonly attestationsDirectory: string;
   readonly manifestPath: string;
   readonly configPath: string;
   readonly eventsPath: string;
   readonly metricsPath: string;
   readonly summaryPath: string;
+  readonly finalAttestationPath: string;
 
   #recorder: LabEventRecorder | undefined;
   #jsonTail: Promise<void> = Promise.resolve();
@@ -90,12 +107,19 @@ export class EvidenceStore {
       ? containedPath(this.runsRoot, experimentId, universeId)
       : containedPath(this.runsRoot, experimentId, universeId, options.runId);
     this.checkpointsDirectory = containedPath(this.directory, "checkpoints");
+    this.attestationsDirectory = containedPath(this.directory, "attestations");
     this.manifestPath = containedPath(this.directory, "manifest.json");
     this.configPath = containedPath(this.directory, "config.json");
     this.eventsPath = containedPath(this.directory, "events.jsonl");
     this.metricsPath = containedPath(this.directory, "metrics.jsonl");
     this.summaryPath = containedPath(this.directory, "summary.json");
+    this.finalAttestationPath = containedPath(this.attestationsDirectory, "final.json");
     this.#retainEvents = options.retainEvents !== false;
+    registerFinalAttestationWriter(this, (attestation) => this.#writeFinalAttestation(attestation));
+    registerEvidenceVerificationSnapshotProvider(
+      this,
+      (operation) => this.#withVerificationSnapshot(operation),
+    );
   }
 
   static async initialize(
@@ -269,10 +293,14 @@ export class EvidenceStore {
     }
 
     await ensureNoSymlinkDirectoryHierarchy(this.checkpointsDirectory);
+    await ensureNoSymlinkDirectoryHierarchy(this.attestationsDirectory);
     await this.#writeImmutable(this.manifestPath, manifest, "manifest");
     await this.#writeImmutable(this.configPath, config, "config");
     await ensureAppendFile(this.metricsPath);
-    this.#lastMetricTick = lastMetricTick(await readCanonicalJsonl<MetricsSnapshot>(this.metricsPath));
+    this.#lastMetricTick = lastMetricTick(await readCanonicalJsonl<MetricsSnapshot>(
+      this.metricsPath,
+      MAX_METRICS_BYTES,
+    ));
     this.#recorder = await LabEventRecorder.open(this.eventsPath, manifest, {
       retainEvents: this.#retainEvents,
     });
@@ -285,6 +313,24 @@ export class EvidenceStore {
       throw new Error("Summary does not match this evidence run");
     }
     await this.#enqueueJson(() => this.#writeImmutable(this.summaryPath, summary, "summary"));
+  }
+
+  async #writeFinalAttestation(attestation: RunEvidenceAttestation): Promise<void> {
+    validateRunEvidenceAttestation(attestation);
+    const manifest = await this.readManifest();
+    if (
+      attestation.subject.runId !== manifest.runId
+      || attestation.subject.experimentId !== manifest.experimentId
+      || attestation.subject.universeId !== manifest.universeId
+      || attestation.scope.kind !== "final"
+    ) {
+      throw new Error("Final attestation does not match this evidence run");
+    }
+    await this.#enqueueJson(() => this.#writeImmutable(
+      this.finalAttestationPath,
+      attestation,
+      "final attestation",
+    ));
   }
 
   async writeCheckpoint(checkpoint: Checkpoint): Promise<void> {
@@ -312,7 +358,7 @@ export class EvidenceStore {
   }
 
   async readManifest(): Promise<RunManifest> {
-    const manifest = await readCanonicalJson<RunManifest>(this.manifestPath);
+    const manifest = await readCanonicalJson<RunManifest>(this.manifestPath, MAX_MANIFEST_BYTES);
     validateManifest(manifest);
     if (manifest.experimentId !== this.experimentId || manifest.universeId !== this.universeId) {
       throw new Error("Stored manifest does not match its evidence directory");
@@ -324,7 +370,7 @@ export class EvidenceStore {
   }
 
   async readConfig(): Promise<GenesisConfig> {
-    const config = await readCanonicalJson<GenesisConfig>(this.configPath);
+    const config = await readCanonicalJson<GenesisConfig>(this.configPath, MAX_CONFIG_BYTES);
     const manifest = await this.readManifest();
     if (config.experimentId !== this.experimentId || hashValue(config) !== manifest.configHash) {
       throw new Error("Stored config does not match its manifest");
@@ -333,7 +379,10 @@ export class EvidenceStore {
   }
 
   async readSummary(): Promise<RunSummary | undefined> {
-    const summary = await readOptionalCanonicalJson<RunSummary>(this.summaryPath);
+    const summary = await readOptionalCanonicalJson<RunSummary>(
+      this.summaryPath,
+      MAX_SUMMARY_BYTES,
+    );
     if (!summary) return undefined;
     const manifest = await this.readManifest();
     if (summary.runId !== manifest.runId || summary.universeId !== this.universeId) {
@@ -342,8 +391,29 @@ export class EvidenceStore {
     return summary;
   }
 
+  async readFinalAttestation(): Promise<RunEvidenceAttestation | undefined> {
+    const attestation = await readOptionalCanonicalJson<unknown>(
+      this.finalAttestationPath,
+      MAX_ATTESTATION_BYTES,
+    );
+    if (attestation === undefined) return undefined;
+    validateRunEvidenceAttestation(attestation);
+    const manifest = await this.readManifest();
+    if (
+      attestation.subject.runId !== manifest.runId
+      || attestation.subject.experimentId !== manifest.experimentId
+      || attestation.subject.universeId !== manifest.universeId
+    ) {
+      throw new Error("Stored final attestation does not match its evidence run");
+    }
+    return attestation;
+  }
+
   async readCheckpoint(tick: number): Promise<Checkpoint | undefined> {
-    const checkpoint = await readOptionalCanonicalJson<Checkpoint>(this.checkpointPath(tick));
+    const checkpoint = await readOptionalCanonicalJson<Checkpoint>(
+      this.checkpointPath(tick),
+      MAX_CHECKPOINT_BYTES,
+    );
     if (!checkpoint) return undefined;
     validateCheckpoint(checkpoint, await this.readManifest());
     return checkpoint;
@@ -378,7 +448,10 @@ export class EvidenceStore {
   }
 
   async readMetrics(): Promise<MetricsSnapshot[]> {
-    const metrics = await readCanonicalJsonl<MetricsSnapshot>(this.metricsPath);
+    const metrics = await readCanonicalJsonl<MetricsSnapshot>(
+      this.metricsPath,
+      MAX_METRICS_BYTES,
+    );
     let prior = -1;
     for (const value of metrics) {
       validateMetric(value);
@@ -411,10 +484,102 @@ export class EvidenceStore {
     return queued;
   }
 
+  async #withVerificationSnapshot<T>(
+    operation: (snapshot: EvidenceVerificationSnapshot) => Promise<T>,
+  ): Promise<T> {
+    return withAnchoredDirectory(this.directory, {}, async (directory) => {
+      const opened: FileHandle[] = [];
+      const openArtifact = async (name: string): Promise<FileHandle> => {
+        const handle = await directory.openRegular(name, constants.O_RDONLY);
+        opened.push(handle);
+        return handle;
+      };
+      try {
+        const handles = {
+          manifest: await openArtifact("manifest.json"),
+          config: await openArtifact("config.json"),
+          events: await openArtifact("events.jsonl"),
+          metrics: await openArtifact("metrics.jsonl"),
+          summary: await openArtifact("summary.json"),
+        };
+        const initialIdentities = await captureOpenFileIdentities(handles);
+        const snapshot: EvidenceVerificationSnapshot = {
+          readManifest: async () => {
+            const manifest = await readCanonicalJsonFromOpenHandle<RunManifest>(
+              handles.manifest,
+              this.manifestPath,
+              MAX_MANIFEST_BYTES,
+            );
+            validateManifest(manifest);
+            if (
+              manifest.experimentId !== this.experimentId
+              || manifest.universeId !== this.universeId
+              || (this.runId !== undefined && manifest.runId !== this.runId)
+            ) {
+              throw new Error("Stored manifest does not match its evidence directory");
+            }
+            return manifest;
+          },
+          readConfig: async (manifest) => {
+            const config = await readCanonicalJsonFromOpenHandle<GenesisConfig>(
+              handles.config,
+              this.configPath,
+              MAX_CONFIG_BYTES,
+            );
+            validateGenesisConfig(config);
+            if (
+              config.experimentId !== this.experimentId
+              || hashValue(config) !== manifest.configHash
+            ) {
+              throw new Error("Stored config does not match its manifest");
+            }
+            return config;
+          },
+          replay: (manifest, config) => ReplayEngine.replayHandle(
+            handles.events,
+            manifest,
+            config,
+          ),
+          readMetrics: async () => {
+            const metrics = await readCanonicalJsonlFromOpenHandle<MetricsSnapshot>(
+              handles.metrics,
+              this.metricsPath,
+              MAX_METRICS_BYTES,
+            );
+            lastMetricTick(metrics);
+            return metrics;
+          },
+          readSummary: async (manifest) => {
+            const summary = await readCanonicalJsonFromOpenHandle<RunSummary>(
+              handles.summary,
+              this.summaryPath,
+              MAX_SUMMARY_BYTES,
+            );
+            if (summary.runId !== manifest.runId || summary.universeId !== this.universeId) {
+              throw new Error("Stored summary does not match its manifest");
+            }
+            return summary;
+          },
+          assertStable: async () => {
+            const finalIdentities = await captureOpenFileIdentities(handles);
+            for (const [name, identity] of Object.entries(initialIdentities)) {
+              if (!sameOpenFileIdentity(identity, finalIdentities[name]!)) {
+                throw new Error(`Evidence artifact changed during verification: ${name}`);
+              }
+            }
+          },
+        };
+        return await operation(snapshot);
+      } finally {
+        for (const handle of opened.reverse()) await handle.close().catch(() => undefined);
+      }
+    });
+  }
+
   async #writeImmutable(path: string, value: unknown, label: string): Promise<void> {
     const serialized = canonicalJson(value);
     try {
-      const existing = await readTextNoFollow(path);
+      const existing = await readTextNoFollow(path, Buffer.byteLength(serialized, "utf8"));
       if (existing === serialized) return;
       throw new EvidenceConflictError(`Refusing to replace existing ${label}`);
     } catch (error) {
@@ -422,6 +587,39 @@ export class EvidenceStore {
     }
     await atomicCanonicalWrite(path, serialized);
   }
+}
+
+interface OpenFileIdentity {
+  device: bigint;
+  inode: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}
+
+async function captureOpenFileIdentities(
+  handles: Readonly<Record<string, FileHandle>>,
+): Promise<Record<string, OpenFileIdentity>> {
+  const identities: Record<string, OpenFileIdentity> = {};
+  for (const [name, handle] of Object.entries(handles)) {
+    const info = await handle.stat({ bigint: true });
+    identities[name] = {
+      device: info.dev,
+      inode: info.ino,
+      size: info.size,
+      mtimeNs: info.mtimeNs,
+      ctimeNs: info.ctimeNs,
+    };
+  }
+  return identities;
+}
+
+function sameOpenFileIdentity(left: OpenFileIdentity, right: OpenFileIdentity): boolean {
+  return left.device === right.device
+    && left.inode === right.inode
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
 }
 
 type CandidateInspection =
@@ -564,7 +762,11 @@ async function atomicCanonicalWrite(path: string, serialized: string): Promise<v
         await link(directory.entry(temporaryName), directory.entry(name));
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        const concurrent = await readTextFromAnchoredDirectory(directory, name);
+        const concurrent = await readTextFromAnchoredDirectory(
+          directory,
+          name,
+          Buffer.byteLength(serialized, "utf8"),
+        );
         if (concurrent !== serialized) {
           throw new EvidenceConflictError("Concurrent immutable artifact conflicts with this run");
         }
@@ -603,6 +805,19 @@ async function ensureAppendFile(path: string): Promise<void> {
 
 async function readCanonicalJson<T>(path: string, maxBytes?: number): Promise<T> {
   const text = await readTextNoFollow(path, maxBytes);
+  return parseCanonicalJson<T>(text, path);
+}
+
+async function readCanonicalJsonFromOpenHandle<T>(
+  handle: FileHandle,
+  path: string,
+  maxBytes?: number,
+): Promise<T> {
+  const text = await readTextFromOpenHandle(handle, path, maxBytes);
+  return parseCanonicalJson<T>(text, path);
+}
+
+function parseCanonicalJson<T>(text: string, path: string): T {
   let value: unknown;
   try {
     value = JSON.parse(text);
@@ -613,23 +828,39 @@ async function readCanonicalJson<T>(path: string, maxBytes?: number): Promise<T>
   return value as T;
 }
 
-async function readOptionalCanonicalJson<T>(path: string): Promise<T | undefined> {
+async function readOptionalCanonicalJson<T>(
+  path: string,
+  maxBytes?: number,
+): Promise<T | undefined> {
   try {
-    return await readCanonicalJson<T>(path);
+    return await readCanonicalJson<T>(path, maxBytes);
   } catch (error) {
     if (isMissing(error)) return undefined;
     throw error;
   }
 }
 
-async function readCanonicalJsonl<T>(path: string): Promise<T[]> {
+async function readCanonicalJsonl<T>(path: string, maxBytes?: number): Promise<T[]> {
   let text: string;
   try {
-    text = await readTextNoFollow(path);
+    text = await readTextNoFollow(path, maxBytes);
   } catch (error) {
     if (isMissing(error)) return [];
     throw error;
   }
+  return parseCanonicalJsonl<T>(text, path);
+}
+
+async function readCanonicalJsonlFromOpenHandle<T>(
+  handle: FileHandle,
+  path: string,
+  maxBytes?: number,
+): Promise<T[]> {
+  const text = await readTextFromOpenHandle(handle, path, maxBytes);
+  return parseCanonicalJsonl<T>(text, path);
+}
+
+function parseCanonicalJsonl<T>(text: string, path: string): T[] {
   if (text === "") return [];
   if (!text.endsWith("\n")) throw new Error(`Truncated JSONL artifact ${path}`);
   const values: T[] = [];
@@ -667,14 +898,22 @@ async function readTextFromHandle(
   maxBytes?: number,
 ): Promise<string> {
   try {
-    const bytes = maxBytes === undefined
-      ? await handle.readFile()
-      : await readBytesBounded(handle, maxBytes, path);
-    if (!isUtf8(bytes)) throw new Error(`Artifact is not valid UTF-8: ${path}`);
-    return bytes.toString("utf8");
+    return await readTextFromOpenHandle(handle, path, maxBytes);
   } finally {
     await handle.close();
   }
+}
+
+async function readTextFromOpenHandle(
+  handle: FileHandle,
+  path: string,
+  maxBytes?: number,
+): Promise<string> {
+  const bytes = maxBytes === undefined
+    ? await handle.readFile({ encoding: null })
+    : await readBytesBounded(handle, maxBytes, path);
+  if (!isUtf8(bytes)) throw new Error(`Artifact is not valid UTF-8: ${path}`);
+  return bytes.toString("utf8");
 }
 
 async function readBytesBounded(

@@ -434,6 +434,42 @@ export interface RunSummary {
   latestMetrics: MetricsSnapshot;
 }
 
+/**
+ * Deterministic final commitment for one completed evidence run.
+ *
+ * The commitment becomes tamper-evident only after the `commitment` value is
+ * copied to an independent append-only system. It deliberately contains no
+ * wall-clock time, host identity, filesystem path, credential, or signature.
+ */
+export interface RunEvidenceAttestation {
+  format: "anu-lab-evidence-attestation";
+  version: 1;
+  hashAlgorithm: "sha256";
+  labSchemaVersion: typeof LAB_SCHEMA_VERSION;
+  subject: {
+    experimentId: string;
+    runId: string;
+    universeId: string;
+    engineVersion: string;
+    policyId: string;
+    taskGeneratorId: string;
+  };
+  scope: {
+    kind: "final";
+    tick: number;
+    seq: number;
+  };
+  evidence: {
+    manifestHash: string;
+    configHash: string;
+    eventHash: string;
+    stateHash: string;
+    summaryHash: string;
+    metricsHash: string;
+  };
+  commitment: string;
+}
+
 export interface PopulationSummary {
   schemaVersion: typeof LAB_SCHEMA_VERSION;
   experimentId: string;

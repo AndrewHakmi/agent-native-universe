@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { EvidenceConflictError, EvidenceStore } from "../dist/lab/artifacts.js";
@@ -435,6 +435,56 @@ test("EvidenceStore discovery bounds manifests and rejects invalid UTF-8", async
       invalid.runId,
     ),
     /not valid UTF-8/,
+  );
+});
+
+test("EvidenceStore bounds runtime artifact reads and immutable comparisons", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-artifacts-runtime-bounds-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const runsRoot = join(directory, "runs");
+  const { config, manifest } = fixture();
+
+  const metricsManifest = { ...manifest, runId: "run:oversized-metrics" };
+  const metricsStore = new EvidenceStore(
+    runsRoot,
+    metricsManifest.experimentId,
+    metricsManifest.universeId,
+    { runId: metricsManifest.runId },
+  );
+  await mkdir(metricsStore.directory, { recursive: true });
+  await writeFile(metricsStore.metricsPath, "", "utf8");
+  await truncate(metricsStore.metricsPath, 67_108_865);
+  await assert.rejects(
+    metricsStore.initialize(metricsManifest, config),
+    /67108864-byte read limit/,
+  );
+
+  const boundedManifest = { ...manifest, runId: "run:bounded-artifacts" };
+  const boundedStore = await EvidenceStore.initialize(runsRoot, boundedManifest, config);
+  const summary = {
+    schemaVersion: LAB_SCHEMA_VERSION,
+    runId: boundedManifest.runId,
+    universeId: boundedManifest.universeId,
+    seed: boundedManifest.seed,
+    ticks: 1,
+    events: 1,
+    finalStateHash: "a".repeat(64),
+    finalEventHash: boundedStore.events.lastHash,
+    latestMetrics: metric(1),
+  };
+  await boundedStore.writeSummary(summary);
+  await truncate(boundedStore.summaryPath, 1_048_577);
+  await assert.rejects(
+    boundedStore.writeSummary(summary),
+    /byte read limit/,
+  );
+
+  const checkpointPath = boundedStore.checkpointPath(1);
+  await writeFile(checkpointPath, "", "utf8");
+  await truncate(checkpointPath, 67_108_865);
+  await assert.rejects(
+    boundedStore.readCheckpoint(1),
+    /67108864-byte read limit/,
   );
 });
 
