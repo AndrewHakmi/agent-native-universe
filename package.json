@@ -17,6 +17,10 @@
     "./autonomous": {
       "types": "./dist/autonomous.d.ts",
       "import": "./dist/autonomous.js"
+    },
+    "./lab": {
+      "types": "./dist/lab/index.d.ts",
+      "import": "./dist/lab/index.js"
     }
   },
   "bin": {
@@ -24,6 +28,8 @@
   },
   "files": [
     "dist",
+    "docs",
+    "experiments",
     "README.md",
     "LICENSE"
   ],
@@ -31,6 +37,7 @@
     "build": "tsc -p tsconfig.json",
     "test": "npm run build && node --test test/*.test.mjs",
     "demo": "npm run build && node dist/examples/payment-network.js",
+    "lab": "npm run build && node dist/lab/runner.js",
     "check": "npm run build && npm test",
     "demo:living": "npm run build && node dist/examples/living-network.js"
   },

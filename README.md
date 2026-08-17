@@ -141,6 +141,36 @@ npm run demo:living
 
 The repository has zero runtime npm dependencies.
 
+## Universe Lab and Genesis-1
+
+The repository now includes a deterministic, event-sourced laboratory for
+role-neutral agent populations. The logical Genesis-1 runner provides finite
+resource physics, hidden-oracle task evaluation, external pressure, hash-chained
+JSONL evidence, evaluator-backed rewards, checkpoints, exact replay, fixed-point
+metrics, bounded parallel populations, and a read-only Observer API.
+
+Run a conservative local experiment and verify it by replay:
+
+```bash
+npm run build
+node dist/lab/runner.js genesis-1 --data-dir ./runs --agents 16 --ticks 500
+node dist/lab/runner.js replay --data-dir ./runs --universe-id U0001
+```
+
+Run the full reference configuration explicitly:
+
+```bash
+node dist/lab/runner.js population \
+  --config ./experiments/genesis-1/config.json \
+  --data-dir ./runs \
+  --universes 32 \
+  --parallel 8
+```
+
+See [Universe Lab](docs/UNIVERSE_LAB.md) for the scientific boundary, evidence
+model, commands, and current logical-v1 limitations. See
+[Lab deployment](docs/LAB_DEPLOYMENT.md) for the hardened Docker/Traefik stand.
+
 ## Imports
 
 ```ts
@@ -189,6 +219,8 @@ src/core/       NanoAgent and LinkProtocol primitives
 src/runtime/    local living topology
 src/v1/         signed distributed graph, persistence, economy and provider adapters
 src/v2/         autonomous encrypted mesh and integrated runtime
+src/lab/        deterministic Universe Lab, Genesis-1 and Observer API
+experiments/    immutable experiment configurations
 test/           deterministic, network and recovery tests
 docs/           architecture and operating semantics
 ```

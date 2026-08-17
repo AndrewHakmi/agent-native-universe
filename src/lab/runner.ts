@@ -1,0 +1,562 @@
+#!/usr/bin/env node
+import { lstat } from "node:fs/promises";
+import type { Server } from "node:http";
+import { parse, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { EvidenceStore } from "./artifacts.js";
+import { canonicalJson } from "./canonical.js";
+import { loadGenesisConfig, validateGenesisConfig } from "./config.js";
+import { runGenesis } from "./genesis.js";
+import { startObserverServer } from "./observer.js";
+import {
+  MAX_POPULATION_PARALLELISM,
+  MAX_POPULATION_UNIVERSES,
+  runPopulation,
+} from "./population.js";
+import { ReplayEngine } from "./replay.js";
+import type { GenesisConfig } from "./types.js";
+
+const DEFAULT_DATA_DIR = "runs";
+const DEFAULT_EXPERIMENT_ID = "genesis-1";
+const DEFAULT_UNIVERSE_ID = "U0001";
+const DEFAULT_OBSERVER_HOST = "0.0.0.0";
+const DEFAULT_OBSERVER_PORT = 3_000;
+const MAX_PATH_BYTES = 4_096;
+const MAX_CONFIG_BYTES = 1_048_576;
+const MAX_TICKS = 10_000_000;
+const MAX_SEED_BYTES = 1_024;
+const RESOURCE_KINDS = [
+  "credits",
+  "llmTokens",
+  "computeMs",
+  "storageBytes",
+  "bandwidthBytes",
+] as const;
+
+const RUN_OPTIONS = new Set([
+  "agents",
+  "checkpoint-every",
+  "config",
+  "data-dir",
+  "experiment",
+  "metric-every",
+  "parallel",
+  "seed",
+  "ticks",
+  "universes",
+]);
+const GENESIS_OPTIONS = new Set([
+  "agents",
+  "checkpoint-every",
+  "config",
+  "data-dir",
+  "experiment",
+  "metric-every",
+  "seed",
+  "ticks",
+  "universe-id",
+]);
+const REPLAY_OPTIONS = new Set([
+  "data-dir",
+  "experiment",
+  "until-tick",
+  "universe-id",
+]);
+const SERVE_OPTIONS = new Set(["data-dir", "host", "port"]);
+
+interface JsonSink {
+  write(chunk: string): unknown;
+}
+
+export interface LabCliIo {
+  stdout: JsonSink;
+  stderr: JsonSink;
+}
+
+interface ParsedOptions {
+  help: boolean;
+  values: Map<string, string>;
+}
+
+class CliUsageError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CliUsageError";
+  }
+}
+
+const HELP = {
+  usage: "anu lab <command> [options]",
+  commands: {
+    run: "alias for population",
+    "genesis-1": "run one logical Genesis-1 universe",
+    population: "run a bounded population of independent universes",
+    replay: "replay one universe from its append-only evidence",
+    serve: "serve read-only evidence HTTP endpoints",
+  },
+  commonRunOptions: {
+    "--data-dir": "evidence root (default: ./runs)",
+    "--config": "Genesis JSON config path (default: built-in safe config)",
+    "--agents": "override initial agent count",
+    "--ticks": "override run ticks",
+    "--seed": "override deterministic base seed",
+  },
+  examples: [
+    "anu lab genesis-1 --data-dir ./runs --universe-id U0001",
+    "anu lab population --data-dir ./runs --universes 32 --parallel 8",
+    "anu lab replay --data-dir ./runs --universe-id U0001",
+    "anu lab serve --data-dir ./runs --host 0.0.0.0 --port 3000",
+  ],
+} as const;
+
+/**
+ * Execute a Lab CLI command without terminating the process.
+ *
+ * This makes the same command surface usable from `anu lab ...`, the dedicated
+ * Docker entrypoint and process-level tests. Every emitted line is one JSON
+ * object suitable for log collectors.
+ */
+export async function runLabCli(
+  argv: readonly string[],
+  partialIo: Partial<LabCliIo> = {},
+): Promise<number> {
+  const io: LabCliIo = {
+    stdout: partialIo.stdout ?? process.stdout,
+    stderr: partialIo.stderr ?? process.stderr,
+  };
+  const command = argv[0];
+
+  if (command === undefined || command === "help" || command === "--help" || command === "-h") {
+    if (argv.length > 1) {
+      return usageFailure(io, command ?? "help", "Help does not accept additional arguments");
+    }
+    writeJson(io.stdout, { command: "help", status: "ok", ...HELP });
+    return 0;
+  }
+
+  try {
+    switch (command) {
+      case "run":
+      case "population":
+        await executePopulation(command, argv.slice(1), io);
+        return 0;
+      case "genesis-1":
+        await executeGenesis(argv.slice(1), io);
+        return 0;
+      case "replay":
+        await executeReplay(argv.slice(1), io);
+        return 0;
+      case "serve":
+        await executeServe(argv.slice(1), io);
+        return 0;
+      default:
+        throw new CliUsageError(`Unknown Lab command: ${command}`);
+    }
+  } catch (error) {
+    const usage = error instanceof CliUsageError;
+    writeJson(io.stderr, {
+      command,
+      status: "error",
+      error: {
+        code: usage ? "invalid_usage" : "command_failed",
+        message: safeErrorMessage(error),
+      },
+    });
+    return usage ? 2 : 1;
+  }
+}
+
+async function executePopulation(
+  invokedCommand: "run" | "population",
+  argv: readonly string[],
+  io: LabCliIo,
+): Promise<void> {
+  const options = parseOptions(argv, RUN_OPTIONS);
+  if (options.help) {
+    writeJson(io.stdout, {
+      command: invokedCommand,
+      status: "ok",
+      usage: "anu lab population [--data-dir PATH] [--universes N] [--parallel N] [config overrides]",
+    });
+    return;
+  }
+
+  const config = await configuredGenesis(options.values);
+  const runsRoot = optionPath(options.values, "data-dir", DEFAULT_DATA_DIR);
+  const universes = optionInteger(
+    options.values,
+    "universes",
+    1,
+    1,
+    MAX_POPULATION_UNIVERSES,
+  );
+  const parallel = optionInteger(
+    options.values,
+    "parallel",
+    1,
+    1,
+    MAX_POPULATION_PARALLELISM,
+  );
+  const population = await runPopulation({ config, runsRoot, universes, parallel });
+  writeJson(io.stdout, {
+    command: invokedCommand,
+    mode: "population",
+    status: "completed",
+    population,
+  });
+}
+
+async function executeGenesis(argv: readonly string[], io: LabCliIo): Promise<void> {
+  const options = parseOptions(argv, GENESIS_OPTIONS);
+  if (options.help) {
+    writeJson(io.stdout, {
+      command: "genesis-1",
+      status: "ok",
+      usage: "anu lab genesis-1 [--data-dir PATH] [--universe-id U0001] [config overrides]",
+    });
+    return;
+  }
+
+  const config = await configuredGenesis(options.values);
+  const runsRoot = optionPath(options.values, "data-dir", DEFAULT_DATA_DIR);
+  const universeId = optionUniverseId(options.values, "universe-id", DEFAULT_UNIVERSE_ID);
+  const summary = await runGenesis({ config, runsRoot, universeId });
+  writeJson(io.stdout, {
+    command: "genesis-1",
+    status: "completed",
+    summary,
+  });
+}
+
+async function executeReplay(argv: readonly string[], io: LabCliIo): Promise<void> {
+  const options = parseOptions(argv, REPLAY_OPTIONS);
+  if (options.help) {
+    writeJson(io.stdout, {
+      command: "replay",
+      status: "ok",
+      usage: "anu lab replay [--data-dir PATH] [--experiment genesis-1] [--universe-id U0001] [--until-tick N]",
+    });
+    return;
+  }
+
+  const runsRoot = optionPath(options.values, "data-dir", DEFAULT_DATA_DIR);
+  const experimentId = optionExperiment(options.values);
+  const universeId = optionUniverseId(options.values, "universe-id", DEFAULT_UNIVERSE_ID);
+  const untilTick = optionalInteger(options.values, "until-tick", 0, MAX_TICKS);
+  const evidence = new EvidenceStore(runsRoot, experimentId, universeId);
+  const manifest = await evidence.readManifest();
+  const replay = await ReplayEngine.replayFile(evidence.eventsPath, manifest, untilTick);
+  writeJson(io.stdout, {
+    command: "replay",
+    status: "completed",
+    manifest,
+    replay,
+  });
+}
+
+async function executeServe(argv: readonly string[], io: LabCliIo): Promise<void> {
+  const options = parseOptions(argv, SERVE_OPTIONS);
+  if (options.help) {
+    writeJson(io.stdout, {
+      command: "serve",
+      status: "ok",
+      usage: "anu lab serve [--data-dir PATH] [--host HOST] [--port 0..65535]",
+    });
+    return;
+  }
+
+  const dataDir = optionPath(options.values, "data-dir", DEFAULT_DATA_DIR);
+  const host = optionHost(options.values.get("host") ?? DEFAULT_OBSERVER_HOST);
+  const port = optionInteger(options.values, "port", DEFAULT_OBSERVER_PORT, 0, 65_535);
+  const server = await startObserverServer({ dataDir, host, port });
+  const address = server.address();
+  const boundPort = address !== null && typeof address === "object" ? address.port : port;
+  installObserverShutdown(server, io);
+  writeJson(io.stdout, {
+    command: "serve",
+    status: "listening",
+    host,
+    port: boundPort,
+  });
+}
+
+async function configuredGenesis(options: ReadonlyMap<string, string>): Promise<GenesisConfig> {
+  const configPath = options.get("config");
+  if (configPath !== undefined) await validateConfigPath(safePath(configPath, "config"));
+  const config = await loadGenesisConfig(
+    configPath === undefined ? undefined : safePath(configPath, "config"),
+  );
+
+  const requestedExperiment = options.get("experiment");
+  if (requestedExperiment !== undefined && requestedExperiment !== config.experimentId) {
+    throw new CliUsageError(
+      `--experiment ${requestedExperiment} does not match config experiment ${config.experimentId}`,
+    );
+  }
+
+  const agents = optionalInteger(options, "agents", 1, 10_000);
+  const ticks = optionalInteger(options, "ticks", 1, MAX_TICKS);
+  const metricEvery = optionalInteger(options, "metric-every", 1, MAX_TICKS);
+  const checkpointEvery = optionalInteger(options, "checkpoint-every", 1, MAX_TICKS);
+  const seed = options.get("seed");
+  if (agents !== undefined) rebalanceTreasuryForAgents(config, agents);
+  if (ticks !== undefined) config.ticks = ticks;
+  if (metricEvery !== undefined) config.metricEvery = metricEvery;
+  if (checkpointEvery !== undefined) config.checkpointEvery = checkpointEvery;
+  if (seed !== undefined) config.seed = safeSeed(seed);
+  validateGenesisConfig(config);
+  return config;
+}
+
+/** Preserve the configured per-universe finite budget across topology overrides. */
+function rebalanceTreasuryForAgents(config: GenesisConfig, nextAgents: number): void {
+  if (nextAgents === config.agents) return;
+  const nextTreasury = structuredClone(config.treasuryResources);
+
+  for (const resource of RESOURCE_KINDS) {
+    const initialPerAgent = config.initialResources[resource];
+    const currentAllocated = initialPerAgent * config.agents;
+    const total = currentAllocated + config.treasuryResources[resource];
+    const nextAllocated = initialPerAgent * nextAgents;
+    if (
+      !Number.isSafeInteger(currentAllocated)
+      || !Number.isSafeInteger(total)
+      || !Number.isSafeInteger(nextAllocated)
+    ) {
+      throw new CliUsageError(`--agents makes the ${resource} budget exceed safe integer precision`);
+    }
+    const remaining = total - nextAllocated;
+    if (remaining < 0) {
+      throw new CliUsageError(`--agents exceeds the finite ${resource} budget`);
+    }
+    nextTreasury[resource] = remaining;
+  }
+
+  config.agents = nextAgents;
+  config.treasuryResources = nextTreasury;
+}
+
+function parseOptions(argv: readonly string[], allowed: ReadonlySet<string>): ParsedOptions {
+  const values = new Map<string, string>();
+  let help = false;
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index]!;
+    if (argument === "--help" || argument === "-h") {
+      if (help) throw new CliUsageError("Duplicate --help option");
+      help = true;
+      continue;
+    }
+    if (!argument.startsWith("--") || argument === "--") {
+      throw new CliUsageError(`Unexpected positional argument: ${argument}`);
+    }
+
+    const equals = argument.indexOf("=");
+    const name = argument.slice(2, equals < 0 ? undefined : equals);
+    if (!allowed.has(name)) throw new CliUsageError(`Unknown option: --${name}`);
+    if (values.has(name)) throw new CliUsageError(`Duplicate option: --${name}`);
+
+    let value: string;
+    if (equals >= 0) {
+      value = argument.slice(equals + 1);
+    } else {
+      const following = argv[index + 1];
+      if (following === undefined || following.startsWith("--")) {
+        throw new CliUsageError(`Option --${name} requires a value`);
+      }
+      value = following;
+      index += 1;
+    }
+    if (value.length === 0) throw new CliUsageError(`Option --${name} requires a non-empty value`);
+    values.set(name, value);
+  }
+
+  if (help && values.size > 0) {
+    throw new CliUsageError("--help cannot be combined with command options");
+  }
+  return { help, values };
+}
+
+function optionPath(
+  options: ReadonlyMap<string, string>,
+  name: string,
+  fallback: string,
+): string {
+  return safePath(options.get(name) ?? fallback, name);
+}
+
+function safePath(value: string, label: string): string {
+  if (value.includes("\0") || Buffer.byteLength(value, "utf8") > MAX_PATH_BYTES) {
+    throw new CliUsageError(`--${label} is not a safe path`);
+  }
+  const absolute = resolve(value);
+  if (absolute === parse(absolute).root) {
+    throw new CliUsageError(`--${label} must not be a filesystem root`);
+  }
+  return absolute;
+}
+
+async function validateConfigPath(path: string): Promise<void> {
+  const info = await lstat(path);
+  if (!info.isFile() || info.isSymbolicLink()) {
+    throw new CliUsageError("--config must identify a regular non-symlink file");
+  }
+  if (info.size > MAX_CONFIG_BYTES) {
+    throw new CliUsageError(`--config exceeds ${MAX_CONFIG_BYTES} bytes`);
+  }
+}
+
+function optionExperiment(options: ReadonlyMap<string, string>): string {
+  const experiment = options.get("experiment") ?? DEFAULT_EXPERIMENT_ID;
+  if (experiment !== DEFAULT_EXPERIMENT_ID) {
+    throw new CliUsageError(`Unsupported experiment: ${experiment}`);
+  }
+  return experiment;
+}
+
+function optionUniverseId(
+  options: ReadonlyMap<string, string>,
+  name: string,
+  fallback: string,
+): string {
+  const value = options.get(name) ?? fallback;
+  if (!/^U[0-9]{4,8}$/.test(value)) {
+    throw new CliUsageError(`--${name} must match U0001-style notation`);
+  }
+  return value;
+}
+
+function optionInteger(
+  options: ReadonlyMap<string, string>,
+  name: string,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+): number {
+  return parseInteger(options.get(name), name, minimum, maximum) ?? fallback;
+}
+
+function optionalInteger(
+  options: ReadonlyMap<string, string>,
+  name: string,
+  minimum: number,
+  maximum: number,
+): number | undefined {
+  return parseInteger(options.get(name), name, minimum, maximum);
+}
+
+function parseInteger(
+  value: string | undefined,
+  name: string,
+  minimum: number,
+  maximum: number,
+): number | undefined {
+  if (value === undefined) return undefined;
+  if (!/^(0|[1-9][0-9]*)$/.test(value)) {
+    throw new CliUsageError(`--${name} must be an integer`);
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new CliUsageError(`--${name} must be from ${minimum} through ${maximum}`);
+  }
+  return parsed;
+}
+
+function safeSeed(seed: string): string {
+  if (
+    seed.trim().length === 0
+    || Buffer.byteLength(seed, "utf8") > MAX_SEED_BYTES
+    || /[\u0000-\u001f\u007f]/u.test(seed)
+  ) {
+    throw new CliUsageError("--seed must be a non-empty printable value no longer than 1024 bytes");
+  }
+  return seed;
+}
+
+function optionHost(host: string): string {
+  if (
+    host.length === 0
+    || host.length > 255
+    || !/^[A-Za-z0-9.:[\]_-]+$/.test(host)
+  ) {
+    throw new CliUsageError("--host must be a valid host name or IP address");
+  }
+  return host;
+}
+
+function installObserverShutdown(server: Server, io: LabCliIo): void {
+  let stopping = false;
+  let forceTimer: NodeJS.Timeout | undefined;
+
+  const cleanup = (): void => {
+    process.off("SIGINT", onSigint);
+    process.off("SIGTERM", onSigterm);
+    if (forceTimer !== undefined) clearTimeout(forceTimer);
+  };
+  const shutdown = (signal: "SIGINT" | "SIGTERM"): void => {
+    if (stopping) {
+      server.closeAllConnections();
+      return;
+    }
+    stopping = true;
+    writeJson(io.stdout, { command: "serve", status: "stopping", signal });
+    forceTimer = setTimeout(() => {
+      process.exitCode = 1;
+      writeJson(io.stderr, {
+        command: "serve",
+        status: "error",
+        error: { code: "shutdown_timeout", message: "Observer shutdown exceeded 10 seconds" },
+      });
+      server.closeAllConnections();
+    }, 10_000);
+    forceTimer.unref();
+    server.close((error?: Error) => {
+      cleanup();
+      if (error !== undefined) {
+        process.exitCode = 1;
+        writeJson(io.stderr, {
+          command: "serve",
+          status: "error",
+          error: { code: "shutdown_failed", message: safeErrorMessage(error) },
+        });
+        return;
+      }
+      writeJson(io.stdout, { command: "serve", status: "stopped", signal });
+    });
+  };
+  const onSigint = (): void => shutdown("SIGINT");
+  const onSigterm = (): void => shutdown("SIGTERM");
+
+  process.once("SIGINT", onSigint);
+  process.once("SIGTERM", onSigterm);
+  server.once("close", cleanup);
+}
+
+function usageFailure(io: LabCliIo, command: string, message: string): number {
+  writeJson(io.stderr, {
+    command,
+    status: "error",
+    error: { code: "invalid_usage", message },
+  });
+  return 2;
+}
+
+function safeErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message.length > 0) {
+    return error.message.slice(0, 1_024).replace(/[\u0000-\u001f\u007f]/gu, " ");
+  }
+  return "Unknown command failure";
+}
+
+function writeJson(sink: JsonSink, value: unknown): void {
+  sink.write(`${canonicalJson(value)}\n`);
+}
+
+function isDirectExecution(): boolean {
+  const entry = process.argv[1];
+  return entry !== undefined && pathToFileURL(resolve(entry)).href === import.meta.url;
+}
+
+if (isDirectExecution()) {
+  process.exitCode = await runLabCli(process.argv.slice(2));
+}
