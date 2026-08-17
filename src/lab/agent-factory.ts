@@ -14,6 +14,7 @@ export function createGenesisAgents(config: GenesisConfig): LabAgentState[] {
     generation: 0,
     lineage: [],
     resources: { ...config.initialResources },
+    inbox: [],
     memory: {},
     learning: {
       attempts: {},
@@ -34,6 +35,7 @@ export function assertRoleNeutralGenesis(agents: LabAgentState[]): void {
     generation: agent.generation,
     lineage: agent.lineage,
     resources: agent.resources,
+    inbox: agent.inbox,
     memory: agent.memory,
     learning: agent.learning,
     actionCounts: agent.actionCounts,

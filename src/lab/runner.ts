@@ -1,5 +1,7 @@
 #!/usr/bin/env node
-import { lstat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { isUtf8 } from "node:buffer";
+import { lstat, open, type FileHandle } from "node:fs/promises";
 import type { Server } from "node:http";
 import { parse, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -23,6 +25,7 @@ const DEFAULT_OBSERVER_HOST = "0.0.0.0";
 const DEFAULT_OBSERVER_PORT = 3_000;
 const MAX_PATH_BYTES = 4_096;
 const MAX_CONFIG_BYTES = 1_048_576;
+const MAX_AUTH_TOKEN_FILE_BYTES = 4_098;
 const MAX_TICKS = 10_000_000;
 const MAX_SEED_BYTES = 1_024;
 const RESOURCE_KINDS = [
@@ -59,10 +62,11 @@ const GENESIS_OPTIONS = new Set([
 const REPLAY_OPTIONS = new Set([
   "data-dir",
   "experiment",
+  "run-id",
   "until-tick",
   "universe-id",
 ]);
-const SERVE_OPTIONS = new Set(["data-dir", "host", "port"]);
+const SERVE_OPTIONS = new Set(["auth-token-file", "data-dir", "host", "port"]);
 
 interface JsonSink {
   write(chunk: string): unknown;
@@ -104,8 +108,8 @@ const HELP = {
   examples: [
     "anu lab genesis-1 --data-dir ./runs --universe-id U0001",
     "anu lab population --data-dir ./runs --universes 32 --parallel 8",
-    "anu lab replay --data-dir ./runs --universe-id U0001",
-    "anu lab serve --data-dir ./runs --host 0.0.0.0 --port 3000",
+    "anu lab replay --data-dir ./runs --universe-id U0001 [--run-id RUN_ID]",
+    "anu lab serve --data-dir ./runs --host 0.0.0.0 --port 3000 [--auth-token-file PATH]",
   ],
 } as const;
 
@@ -234,7 +238,7 @@ async function executeReplay(argv: readonly string[], io: LabCliIo): Promise<voi
     writeJson(io.stdout, {
       command: "replay",
       status: "ok",
-      usage: "anu lab replay [--data-dir PATH] [--experiment genesis-1] [--universe-id U0001] [--until-tick N]",
+      usage: "anu lab replay [--data-dir PATH] [--experiment genesis-1] [--universe-id U0001] [--run-id RUN_ID] [--until-tick N]",
     });
     return;
   }
@@ -242,10 +246,12 @@ async function executeReplay(argv: readonly string[], io: LabCliIo): Promise<voi
   const runsRoot = optionPath(options.values, "data-dir", DEFAULT_DATA_DIR);
   const experimentId = optionExperiment(options.values);
   const universeId = optionUniverseId(options.values, "universe-id", DEFAULT_UNIVERSE_ID);
+  const runId = optionalRunId(options.values);
   const untilTick = optionalInteger(options.values, "until-tick", 0, MAX_TICKS);
-  const evidence = new EvidenceStore(runsRoot, experimentId, universeId);
+  const evidence = await EvidenceStore.openExisting(runsRoot, experimentId, universeId, runId);
   const manifest = await evidence.readManifest();
-  const replay = await ReplayEngine.replayFile(evidence.eventsPath, manifest, untilTick);
+  const config = await evidence.readConfig();
+  const replay = await ReplayEngine.replayFile(evidence.eventsPath, manifest, config, untilTick);
   writeJson(io.stdout, {
     command: "replay",
     status: "completed",
@@ -260,7 +266,7 @@ async function executeServe(argv: readonly string[], io: LabCliIo): Promise<void
     writeJson(io.stdout, {
       command: "serve",
       status: "ok",
-      usage: "anu lab serve [--data-dir PATH] [--host HOST] [--port 0..65535]",
+      usage: "anu lab serve [--data-dir PATH] [--host HOST] [--port 0..65535] [--auth-token-file PATH]",
     });
     return;
   }
@@ -268,16 +274,60 @@ async function executeServe(argv: readonly string[], io: LabCliIo): Promise<void
   const dataDir = optionPath(options.values, "data-dir", DEFAULT_DATA_DIR);
   const host = optionHost(options.values.get("host") ?? DEFAULT_OBSERVER_HOST);
   const port = optionInteger(options.values, "port", DEFAULT_OBSERVER_PORT, 0, 65_535);
-  const server = await startObserverServer({ dataDir, host, port });
+  const authTokenFile = options.values.get("auth-token-file");
+  const authToken = authTokenFile === undefined
+    ? undefined
+    : await readObserverAuthTokenFile(safePath(authTokenFile, "auth-token-file"));
+  const server = await startObserverServer({
+    dataDir,
+    host,
+    port,
+    ...(authToken === undefined ? {} : { authToken }),
+  });
   const address = server.address();
   const boundPort = address !== null && typeof address === "object" ? address.port : port;
   installObserverShutdown(server, io);
   writeJson(io.stdout, {
     command: "serve",
     status: "listening",
+    authentication: authToken === undefined ? "none" : "bearer",
     host,
     port: boundPort,
   });
+}
+
+async function readObserverAuthTokenFile(path: string): Promise<string> {
+  let file: FileHandle | undefined;
+  let secretBytes: Buffer | undefined;
+  try {
+    const pathInfo = await lstat(path);
+    if (!pathInfo.isFile() || pathInfo.isSymbolicLink()) throw new Error("invalid");
+    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const info = await file.stat();
+    if (!info.isFile() || info.size > MAX_AUTH_TOKEN_FILE_BYTES) throw new Error("invalid");
+
+    const bytes = Buffer.alloc(MAX_AUTH_TOKEN_FILE_BYTES + 1);
+    secretBytes = bytes;
+    let offset = 0;
+    while (offset <= MAX_AUTH_TOKEN_FILE_BYTES) {
+      const result = await file.read(bytes, offset, bytes.length - offset, offset);
+      if (result.bytesRead === 0) break;
+      offset += result.bytesRead;
+    }
+    if (offset > MAX_AUTH_TOKEN_FILE_BYTES) throw new Error("invalid");
+    const content = bytes.subarray(0, offset);
+    if (!isUtf8(content)) throw new Error("invalid");
+
+    let token = content.toString("utf8");
+    if (token.endsWith("\r\n")) token = token.slice(0, -2);
+    else if (token.endsWith("\n")) token = token.slice(0, -1);
+    return token;
+  } catch {
+    throw new Error("Observer authentication token file could not be read or is invalid");
+  } finally {
+    secretBytes?.fill(0);
+    await file?.close().catch(() => undefined);
+  }
 }
 
 async function configuredGenesis(options: ReadonlyMap<string, string>): Promise<GenesisConfig> {
@@ -422,6 +472,15 @@ function optionUniverseId(
   const value = options.get(name) ?? fallback;
   if (!/^U[0-9]{4,8}$/.test(value)) {
     throw new CliUsageError(`--${name} must match U0001-style notation`);
+  }
+  return value;
+}
+
+function optionalRunId(options: ReadonlyMap<string, string>): string | undefined {
+  const value = options.get("run-id");
+  if (value === undefined) return undefined;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value) || value.includes("..")) {
+    throw new CliUsageError("--run-id must be a safe evidence run identifier");
   }
   return value;
 }

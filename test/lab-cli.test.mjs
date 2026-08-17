@@ -82,9 +82,9 @@ test("run aliases population, conserves finite resources and produces replayable
   assert.equal(output.status, "completed");
   assert.deepEqual(output.population.universes.map((summary) => summary.universeId), ["U0001", "U0002"]);
 
-  for (const universeId of ["U0001", "U0002"]) {
+  for (const summary of output.population.universes) {
     const config = JSON.parse(await readFile(
-      join(evidenceRoot, "genesis-1", universeId, "config.json"),
+      join(evidenceRoot, "genesis-1", summary.universeId, summary.runId, "config.json"),
       "utf8",
     ));
     assert.equal(config.agents, 2);
@@ -105,6 +105,67 @@ test("run aliases population, conserves finite resources and produces replayable
   assert.equal(replayOutput.status, "completed");
   assert.equal(replayOutput.replay.stateHash, output.population.universes[0].finalStateHash);
   assert.equal(replayOutput.replay.state.completed, true);
+
+  const secondRun = invoke("dist/lab/runner.js", [
+    "genesis-1",
+    "--data-dir",
+    evidenceRoot,
+    "--universe-id",
+    "U0001",
+    "--agents",
+    "2",
+    "--ticks",
+    "1",
+    "--metric-every",
+    "1",
+    "--checkpoint-every",
+    "1",
+    "--seed",
+    "cli-test-second-run",
+  ]);
+  assert.equal(secondRun.status, 0, secondRun.stderr);
+  const secondSummary = parseSingleJson(secondRun.stdout).summary;
+  assert.notEqual(secondSummary.runId, output.population.universes[0].runId);
+
+  const ambiguousReplay = invoke("dist/lab/runner.js", [
+    "replay",
+    "--data-dir",
+    evidenceRoot,
+    "--universe-id",
+    "U0001",
+  ]);
+  assert.equal(ambiguousReplay.status, 1);
+  assert.match(
+    parseSingleJson(ambiguousReplay.stderr).error.message,
+    /Multiple supported evidence runs.*--run-id/,
+  );
+
+  const explicitReplay = invoke("dist/lab/runner.js", [
+    "replay",
+    "--data-dir",
+    evidenceRoot,
+    "--universe-id",
+    "U0001",
+    "--run-id",
+    output.population.universes[0].runId,
+  ]);
+  assert.equal(explicitReplay.status, 0, explicitReplay.stderr);
+  assert.equal(
+    parseSingleJson(explicitReplay.stdout).replay.stateHash,
+    output.population.universes[0].finalStateHash,
+  );
+
+  const unsafeReplay = invoke("dist/lab/runner.js", [
+    "replay",
+    "--data-dir",
+    evidenceRoot,
+    "--universe-id",
+    "U0001",
+    "--run-id",
+    "../outside",
+  ]);
+  assert.equal(unsafeReplay.status, 2);
+  assert.match(parseSingleJson(unsafeReplay.stderr).error.message, /safe evidence run identifier/);
 
   const impossiblePopulation = invoke("dist/lab/runner.js", [
     "population",

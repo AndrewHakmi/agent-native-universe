@@ -1,11 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { EvidenceConflictError, EvidenceStore } from "../dist/lab/artifacts.js";
 import { canonicalJson, hashValue } from "../dist/lab/canonical.js";
 import { DEFAULT_GENESIS_CONFIG } from "../dist/lab/config.js";
+import { LAB_ENGINE_VERSION } from "../dist/lab/manifest.js";
 import { LAB_SCHEMA_VERSION } from "../dist/lab/types.js";
 
 const zeroResources = () => ({
@@ -21,7 +22,7 @@ function fixture() {
   const manifest = {
     schemaVersion: LAB_SCHEMA_VERSION,
     experimentId: config.experimentId,
-    engineVersion: "genesis-logical-v1.0.0",
+    engineVersion: LAB_ENGINE_VERSION,
     mode: "logical",
     policyId: "neutral-backpressure-v1",
     taskGeneratorId: "deterministic-task-stream-v1",
@@ -95,7 +96,13 @@ test("EvidenceStore initializes the canonical run layout and reads every artifac
   const runsRoot = join(directory, "runs");
   const { config, manifest } = fixture();
   const store = await EvidenceStore.initialize(runsRoot, manifest, config);
-  const expectedDirectory = join(runsRoot, manifest.experimentId, manifest.universeId);
+  const expectedDirectory = join(
+    runsRoot,
+    manifest.experimentId,
+    manifest.universeId,
+    manifest.runId,
+  );
+  assert.equal(store.runId, manifest.runId);
   assert.equal(store.directory, expectedDirectory);
   assert.equal(await readFile(join(expectedDirectory, "manifest.json"), "utf8"), canonicalJson(manifest));
   assert.equal(await readFile(join(expectedDirectory, "config.json"), "utf8"), canonicalJson(config));
@@ -158,6 +165,279 @@ test("EvidenceStore initializes the canonical run layout and reads every artifac
   assert.deepEqual(await resumed.readMetrics(), metrics);
 });
 
+test("EvidenceStore discovers one addressed run and requires explicit selection for two", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-artifacts-discovery-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const runsRoot = join(directory, "runs");
+  const { config, manifest } = fixture();
+
+  await mkdir(join(runsRoot, manifest.experimentId, "U9999"), { recursive: true });
+  await assert.rejects(
+    EvidenceStore.openExisting(runsRoot, manifest.experimentId, "U9999"),
+    (error) => {
+      assert.match(error.message, /No supported evidence runs found/);
+      assert.doesNotMatch(error.message, /specify --run-id/);
+      return true;
+    },
+  );
+
+  const first = await EvidenceStore.initialize(runsRoot, manifest, config);
+  const deterministicReopen = await EvidenceStore.initialize(runsRoot, manifest, config);
+  assert.equal(deterministicReopen.directory, first.directory);
+  assert.deepEqual(await deterministicReopen.readManifest(), manifest);
+
+  const selectedByDefault = await EvidenceStore.openExisting(
+    runsRoot,
+    manifest.experimentId,
+    manifest.universeId,
+  );
+  assert.equal(selectedByDefault.directory, first.directory);
+
+  const secondManifest = { ...manifest, runId: "run:test-002" };
+  const second = await EvidenceStore.initialize(runsRoot, secondManifest, config);
+  assert.notEqual(second.directory, first.directory);
+  assert.equal(
+    second.directory,
+    join(runsRoot, manifest.experimentId, manifest.universeId, secondManifest.runId),
+  );
+  await assert.rejects(
+    EvidenceStore.openExisting(runsRoot, manifest.experimentId, manifest.universeId),
+    /Multiple supported evidence runs.*--run-id/,
+  );
+
+  const explicitlySelected = await EvidenceStore.openExisting(
+    runsRoot,
+    manifest.experimentId,
+    manifest.universeId,
+    secondManifest.runId,
+  );
+  assert.equal(explicitlySelected.directory, second.directory);
+  assert.deepEqual(await explicitlySelected.readManifest(), secondManifest);
+});
+
+test("EvidenceStore preserves legacy reads and skips unsupported engines during discovery", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-artifacts-legacy-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const runsRoot = join(directory, "runs");
+  const { config, manifest } = fixture();
+
+  const legacyManifest = {
+    ...manifest,
+    runId: "run:legacy-current",
+    universeId: "U0002",
+  };
+  const legacy = new EvidenceStore(runsRoot, legacyManifest.experimentId, legacyManifest.universeId);
+  await legacy.initialize(legacyManifest, config);
+  const implicitLegacy = await EvidenceStore.openExisting(
+    runsRoot,
+    legacyManifest.experimentId,
+    legacyManifest.universeId,
+  );
+  assert.equal(implicitLegacy.directory, legacy.directory);
+  assert.equal(implicitLegacy.runId, undefined);
+  const explicitLegacy = await EvidenceStore.openExisting(
+    runsRoot,
+    legacyManifest.experimentId,
+    legacyManifest.universeId,
+    legacyManifest.runId,
+  );
+  assert.equal(explicitLegacy.directory, legacy.directory);
+
+  const currentManifest = {
+    ...manifest,
+    runId: "run:current-engine",
+    universeId: "U0003",
+  };
+  const current = await EvidenceStore.initialize(runsRoot, currentManifest, config);
+  const unsupportedLegacy = {
+    ...currentManifest,
+    engineVersion: "genesis-logical-v1.0.0",
+    runId: "run:legacy-v1",
+  };
+  const universeDirectory = join(
+    runsRoot,
+    currentManifest.experimentId,
+    currentManifest.universeId,
+  );
+  await writeFile(join(universeDirectory, "manifest.json"), canonicalJson(unsupportedLegacy), "utf8");
+
+  const implicitCurrent = await EvidenceStore.openExisting(
+    runsRoot,
+    currentManifest.experimentId,
+    currentManifest.universeId,
+  );
+  assert.equal(implicitCurrent.directory, current.directory);
+  await assert.rejects(
+    EvidenceStore.openExisting(
+      runsRoot,
+      currentManifest.experimentId,
+      currentManifest.universeId,
+      unsupportedLegacy.runId,
+    ),
+    /unsupported.*engineVersion genesis-logical-v1\.0\.0/i,
+  );
+
+  const unsupportedSchema = {
+    ...currentManifest,
+    schemaVersion: 999,
+    runId: "run:unsupported-schema",
+  };
+  const unsupportedDirectory = join(universeDirectory, unsupportedSchema.runId);
+  await mkdir(unsupportedDirectory);
+  await writeFile(
+    join(unsupportedDirectory, "manifest.json"),
+    canonicalJson(unsupportedSchema),
+    "utf8",
+  );
+  const stillImplicitCurrent = await EvidenceStore.openExisting(
+    runsRoot,
+    currentManifest.experimentId,
+    currentManifest.universeId,
+  );
+  assert.equal(stillImplicitCurrent.directory, current.directory);
+  await assert.rejects(
+    EvidenceStore.openExisting(
+      runsRoot,
+      currentManifest.experimentId,
+      currentManifest.universeId,
+      unsupportedSchema.runId,
+    ),
+    /unsupported implementation.*schemaVersion 999/i,
+  );
+});
+
+test("EvidenceStore discovery rejects traversal and symbolic links", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-artifacts-symlink-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const runsRoot = join(directory, "runs");
+  const universeDirectory = join(runsRoot, "genesis-1", "U0001");
+  const outside = join(directory, "outside");
+  await mkdir(outside, { recursive: true });
+  await mkdir(universeDirectory, { recursive: true });
+  await symlink(outside, join(universeDirectory, "run:linked"), "dir");
+
+  await assert.rejects(
+    EvidenceStore.openExisting(runsRoot, "genesis-1", "U0001"),
+    /symbolic link/,
+  );
+  await assert.rejects(
+    EvidenceStore.openExisting(runsRoot, "genesis-1", "U0001", "run:linked"),
+    /symbolic link/,
+  );
+  await assert.rejects(
+    EvidenceStore.openExisting(runsRoot, "genesis-1", "U0001", "../outside"),
+    /unsafe/,
+  );
+});
+
+test("EvidenceStore writers reject symlinked hierarchy and artifacts without touching targets", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-artifacts-writer-symlink-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const runsRoot = join(directory, "runs");
+  const { config, manifest } = fixture();
+
+  const outsideHierarchy = join(directory, "outside-hierarchy");
+  const linkedRunsRoot = join(directory, "linked-runs");
+  await mkdir(outsideHierarchy);
+  await symlink(outsideHierarchy, linkedRunsRoot, "dir");
+  await assert.rejects(
+    EvidenceStore.initialize(linkedRunsRoot, manifest, config),
+    /symbolic link directory/,
+  );
+  assert.deepEqual(await readdir(outsideHierarchy), []);
+
+  const eventsTarget = join(directory, "outside-events.jsonl");
+  await writeFile(eventsTarget, "outside-events", "utf8");
+  const eventStore = new EvidenceStore(
+    runsRoot,
+    manifest.experimentId,
+    manifest.universeId,
+    { runId: manifest.runId },
+  );
+  await mkdir(eventStore.checkpointsDirectory, { recursive: true });
+  await symlink(eventsTarget, eventStore.eventsPath, "file");
+  await assert.rejects(eventStore.initialize(manifest, config), /symbolic link file/);
+  assert.equal(await readFile(eventsTarget, "utf8"), "outside-events");
+
+  const metricsManifest = { ...manifest, runId: "run:metrics-symlink" };
+  const metricsStore = new EvidenceStore(
+    runsRoot,
+    metricsManifest.experimentId,
+    metricsManifest.universeId,
+    { runId: metricsManifest.runId },
+  );
+  const metricsTarget = join(directory, "outside-metrics.jsonl");
+  await writeFile(metricsTarget, "outside-metrics", "utf8");
+  await mkdir(metricsStore.checkpointsDirectory, { recursive: true });
+  await symlink(metricsTarget, metricsStore.metricsPath, "file");
+  await assert.rejects(metricsStore.initialize(metricsManifest, config), /symbolic link file/);
+  assert.equal(await readFile(metricsTarget, "utf8"), "outside-metrics");
+
+  const checkpointManifest = { ...manifest, runId: "run:checkpoint-symlink" };
+  const checkpointStore = await EvidenceStore.initialize(runsRoot, checkpointManifest, config);
+  const checkpointTarget = join(directory, "outside-checkpoint.json");
+  await writeFile(checkpointTarget, "outside-checkpoint", "utf8");
+  await symlink(checkpointTarget, checkpointStore.checkpointPath(1), "file");
+  const checkpointState = state(checkpointManifest, 1);
+  await assert.rejects(
+    checkpointStore.writeCheckpoint({
+      schemaVersion: LAB_SCHEMA_VERSION,
+      runId: checkpointManifest.runId,
+      universeId: checkpointManifest.universeId,
+      tick: 1,
+      seq: checkpointStore.events.lastSeq,
+      eventHash: checkpointStore.events.lastHash,
+      stateHash: hashValue(checkpointState),
+      state: checkpointState,
+    }),
+    /symbolic link file/,
+  );
+  assert.equal(await readFile(checkpointTarget, "utf8"), "outside-checkpoint");
+});
+
+test("EvidenceStore discovery bounds manifests and rejects invalid UTF-8", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-artifacts-bounds-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const runsRoot = join(directory, "runs");
+  const { config, manifest } = fixture();
+
+  const oversized = new EvidenceStore(
+    runsRoot,
+    manifest.experimentId,
+    manifest.universeId,
+    { runId: "run:oversized-manifest" },
+  );
+  await mkdir(oversized.directory, { recursive: true });
+  await writeFile(oversized.manifestPath, Buffer.alloc(1_048_577, 0x20));
+  await assert.rejects(
+    EvidenceStore.openExisting(
+      runsRoot,
+      manifest.experimentId,
+      manifest.universeId,
+      oversized.runId,
+    ),
+    /manifest exceeds the 1048576-byte discovery limit/,
+  );
+
+  const invalid = new EvidenceStore(
+    runsRoot,
+    manifest.experimentId,
+    manifest.universeId,
+    { runId: "run:invalid-utf8" },
+  );
+  await mkdir(invalid.directory);
+  await writeFile(invalid.manifestPath, Buffer.from([0xff]));
+  await assert.rejects(
+    EvidenceStore.openExisting(
+      runsRoot,
+      manifest.experimentId,
+      manifest.universeId,
+      invalid.runId,
+    ),
+    /not valid UTF-8/,
+  );
+});
+
 test("EvidenceStore rejects traversal and unsafe run identifiers before writing", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "anu-artifacts-safe-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -165,6 +445,10 @@ test("EvidenceStore rejects traversal and unsafe run identifiers before writing"
   assert.throws(() => new EvidenceStore(directory, "../genesis-1", "U0001"), /unsafe/);
   assert.throws(() => new EvidenceStore(directory, "genesis-1", "../../outside"), /unsafe/);
   assert.throws(() => new EvidenceStore(directory, "genesis-1", "U\\outside"), /unsafe/);
+  assert.throws(
+    () => new EvidenceStore(directory, "genesis-1", "U0001", { runId: "../run" }),
+    /unsafe/,
+  );
   await assert.rejects(
     EvidenceStore.initialize(directory, { ...manifest, runId: "../run" }, config),
     /unsafe/,
@@ -172,6 +456,10 @@ test("EvidenceStore rejects traversal and unsafe run identifiers before writing"
   await assert.rejects(
     EvidenceStore.initialize(directory, { ...manifest, configHash: "0".repeat(64) }, config),
     /Config hash mismatch/,
+  );
+  await assert.rejects(
+    EvidenceStore.initialize(directory, { ...manifest, seed: {} }, config),
+    /seed must be a non-empty string/,
   );
   assert.deepEqual(await readdir(directory), []);
 });
@@ -207,7 +495,6 @@ test("conflicts and failed resumes preserve existing evidence byte-for-byte", as
   changedConfig.ticks += 1;
   const conflictingManifest = {
     ...manifest,
-    runId: "run:conflict",
     configHash: hashValue(changedConfig),
   };
   await assert.rejects(

@@ -47,7 +47,7 @@ services:
         - CMD
         - node
         - -e
-        - "fetch('http://127.0.0.1:3000/healthz').then((response)=>process.exit(response.ok?0:1)).catch(()=>process.exit(1))"
+        - "fetch('http://127.0.0.1:3000/readyz').then((response)=>process.exit(response.ok?0:1)).catch(()=>process.exit(1))"
       interval: 30s
       timeout: 5s
       start_period: 20s
@@ -55,8 +55,8 @@ services:
     labels:
       traefik.enable: "false"
 
-  # Public routing is deliberately opt-in. Enable only after replacing the
-  # server's placeholder infra-auth-dev credential with a rotated secret/SSO.
+  # Public routing is deliberately opt-in. It requires both a file-mounted
+  # application Bearer token and a rotated Traefik authentication middleware.
   lab-observer-edge:
     <<: *lab-runtime
     profiles:
@@ -70,6 +70,11 @@ services:
       - /data
       - --port
       - "3000"
+      - --auth-token-file
+      - /run/secrets/anu_lab_observer_token
+    secrets:
+      - source: anu_lab_observer_token
+        target: anu_lab_observer_token
     volumes:
       - lab-evidence:/data:ro
     expose:
@@ -82,7 +87,7 @@ services:
         - CMD
         - node
         - -e
-        - "fetch('http://127.0.0.1:3000/healthz').then((response)=>process.exit(response.ok?0:1)).catch(()=>process.exit(1))"
+        - "fetch('http://127.0.0.1:3000/readyz').then((response)=>process.exit(response.ok?0:1)).catch(()=>process.exit(1))"
       interval: 30s
       timeout: 5s
       start_period: 20s
@@ -94,7 +99,7 @@ services:
       traefik.http.routers.anu-lab-observer.entrypoints: "websecure"
       traefik.http.routers.anu-lab-observer.tls: "true"
       traefik.http.routers.anu-lab-observer.tls.certresolver: "letsencrypt"
-      traefik.http.routers.anu-lab-observer.middlewares: "${ANU_LAB_AUTH_MIDDLEWARE:-anu-lab-auth-required@docker},anu-lab-security@docker"
+      traefik.http.routers.anu-lab-observer.middlewares: "${ANU_LAB_AUTH_MIDDLEWARE:-anu-lab-auth-required@docker},anu-lab-security@docker,anu-lab-rate-limit@docker,anu-lab-inflight@docker"
       traefik.http.routers.anu-lab-observer.service: "anu-lab-observer"
       traefik.http.services.anu-lab-observer.loadbalancer.server.port: "3000"
       traefik.http.services.anu-lab-observer.loadbalancer.healthcheck.path: "/readyz"
@@ -103,6 +108,12 @@ services:
       traefik.http.middlewares.anu-lab-security.headers.contenttypenosniff: "true"
       traefik.http.middlewares.anu-lab-security.headers.framedeny: "true"
       traefik.http.middlewares.anu-lab-security.headers.referrerpolicy: "no-referrer"
+      traefik.http.middlewares.anu-lab-security.headers.forcestsheader: "true"
+      traefik.http.middlewares.anu-lab-security.headers.stsseconds: "31536000"
+      traefik.http.middlewares.anu-lab-rate-limit.ratelimit.average: "20"
+      traefik.http.middlewares.anu-lab-rate-limit.ratelimit.period: "1s"
+      traefik.http.middlewares.anu-lab-rate-limit.ratelimit.burst: "40"
+      traefik.http.middlewares.anu-lab-inflight.inflightreq.amount: "32"
 
   lab-runner:
     <<: *lab-runtime
@@ -139,3 +150,9 @@ networks:
 volumes:
   lab-evidence:
     driver: local
+
+secrets:
+  anu_lab_observer_token:
+    # Keep the real file outside the repository. /dev/null makes edge startup
+    # fail closed while allowing the default Compose model to be validated.
+    file: ${ANU_LAB_OBSERVER_TOKEN_FILE:-/dev/null}

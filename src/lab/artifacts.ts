@@ -1,18 +1,24 @@
+import { constants } from "node:fs";
+import { isUtf8 } from "node:buffer";
 import {
   link,
-  mkdir,
-  open,
-  readFile,
+  opendir,
   readdir,
   unlink,
 } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { canonicalJson, hashValue } from "./canonical.js";
 import { LabEventRecorder } from "./event-recorder.js";
 import {
-  LAB_ENGINE_VERSION,
-  LAB_POLICY_ID,
-  LAB_TASK_GENERATOR_ID,
+  ensureNoSymlinkDirectoryHierarchy,
+  openRegularFileNoFollow,
+  unlinkEntryNoFollow,
+  withAnchoredDirectory,
+  withAnchoredParentDirectory,
+  type AnchoredDirectory,
+} from "./event-stream.js";
+import {
+  assertLabManifestImplementation,
 } from "./manifest.js";
 import type {
   Checkpoint,
@@ -29,8 +35,20 @@ export class EvidenceConflictError extends Error {
   }
 }
 
+const MAX_DISCOVERY_ENTRIES = 10_000;
+const MAX_MANIFEST_BYTES = 1_048_576;
+
+export interface EvidenceStoreOptions {
+  /** Retain the full event log for synchronous inspection. Disable for long runs. */
+  retainEvents?: boolean;
+  /** Address evidence by immutable run identity below the universe directory. */
+  runId?: string;
+}
+
 /**
- * Durable evidence layout rooted at `<runsRoot>/<experiment>/<universe>`.
+ * Durable evidence layout rooted at
+ * `<runsRoot>/<experiment>/<universe>/<runId>` for new runs. Legacy evidence
+ * directly below `<universe>` remains readable through `openExisting`.
  *
  * Scientific JSON is canonical and contains only caller-provided logical
  * values. The store never injects wall-clock timestamps into payloads.
@@ -39,6 +57,7 @@ export class EvidenceStore {
   readonly runsRoot: string;
   readonly experimentId: string;
   readonly universeId: string;
+  readonly runId: string | undefined;
   readonly directory: string;
   readonly checkpointsDirectory: string;
   readonly manifestPath: string;
@@ -51,31 +70,138 @@ export class EvidenceStore {
   #jsonTail: Promise<void> = Promise.resolve();
   #metricsTail: Promise<void> = Promise.resolve();
   #lastMetricTick = -1;
+  readonly #retainEvents: boolean;
 
-  constructor(runsRoot: string, experimentId: string, universeId: string) {
+  constructor(
+    runsRoot: string,
+    experimentId: string,
+    universeId: string,
+    options: EvidenceStoreOptions = {},
+  ) {
     if (!runsRoot) throw new TypeError("Evidence runs root must not be empty");
     assertSafeIdentifier(experimentId, "experiment id");
     assertSafeIdentifier(universeId, "universe id");
+    if (options.runId !== undefined) assertSafeIdentifier(options.runId, "run id");
     this.runsRoot = resolve(runsRoot);
     this.experimentId = experimentId;
     this.universeId = universeId;
-    this.directory = containedPath(this.runsRoot, experimentId, universeId);
+    this.runId = options.runId;
+    this.directory = options.runId === undefined
+      ? containedPath(this.runsRoot, experimentId, universeId)
+      : containedPath(this.runsRoot, experimentId, universeId, options.runId);
     this.checkpointsDirectory = containedPath(this.directory, "checkpoints");
     this.manifestPath = containedPath(this.directory, "manifest.json");
     this.configPath = containedPath(this.directory, "config.json");
     this.eventsPath = containedPath(this.directory, "events.jsonl");
     this.metricsPath = containedPath(this.directory, "metrics.jsonl");
     this.summaryPath = containedPath(this.directory, "summary.json");
+    this.#retainEvents = options.retainEvents !== false;
   }
 
   static async initialize(
     runsRoot: string,
     manifest: RunManifest,
     config: GenesisConfig,
+    options: EvidenceStoreOptions = {},
   ): Promise<EvidenceStore> {
-    const store = new EvidenceStore(runsRoot, manifest.experimentId, manifest.universeId);
+    if (options.runId !== undefined && options.runId !== manifest.runId) {
+      throw new Error("Evidence store run id does not match the manifest");
+    }
+    const store = new EvidenceStore(
+      runsRoot,
+      manifest.experimentId,
+      manifest.universeId,
+      { ...options, runId: manifest.runId },
+    );
     await store.initialize(manifest, config);
     return store;
+  }
+
+  /**
+   * Open already-published evidence without guessing between multiple runs.
+   *
+   * With an explicit run id, the canonical child directory is selected first
+   * and a matching legacy manifest is used only as a compatibility fallback.
+   * Without one, exactly one evidence candidate supported by this engine must
+   * exist. Directory and artifact symlinks are never followed.
+   */
+  static async openExisting(
+    runsRoot: string,
+    experimentId: string,
+    universeId: string,
+    runId?: string,
+  ): Promise<EvidenceStore> {
+    if (runId !== undefined) assertSafeIdentifier(runId, "run id");
+    const legacy = new EvidenceStore(runsRoot, experimentId, universeId);
+    const hierarchyExists = await validateDiscoveryHierarchy(legacy);
+    if (!hierarchyExists) {
+      throw selectionError(experimentId, universeId, runId);
+    }
+
+    if (runId !== undefined) {
+      const addressed = new EvidenceStore(runsRoot, experimentId, universeId, { runId });
+      const exact = await inspectEvidenceCandidate(addressed, runId);
+      if (exact.kind === "supported") return addressed;
+      if (exact.kind === "unsupported") throw unsupportedImplementationError(exact);
+
+      const legacyCandidate = await inspectEvidenceCandidate(legacy);
+      if (legacyCandidate.kind !== "missing" && legacyCandidate.manifest.runId === runId) {
+        if (legacyCandidate.kind === "unsupported") {
+          throw unsupportedImplementationError(legacyCandidate);
+        }
+        return legacy;
+      }
+      throw selectionError(experimentId, universeId, runId);
+    }
+
+    const candidates: EvidenceStore[] = [];
+    const legacyCandidate = await inspectEvidenceCandidate(legacy);
+    if (legacyCandidate.kind === "supported") candidates.push(legacy);
+
+    const entryNames: string[] = [];
+    let entryCount = 0;
+    await withAnchoredDirectory(legacy.directory, {}, async (anchored) => {
+      const directory = await opendir(anchored.path);
+      for await (const entry of directory) {
+        entryCount += 1;
+        if (entryCount > MAX_DISCOVERY_ENTRIES) {
+          throw new Error(
+            `Evidence universe exceeds the ${MAX_DISCOVERY_ENTRIES}-entry discovery limit`,
+          );
+        }
+        if (entry.isSymbolicLink()) {
+          throw new Error(`Refusing symbolic link evidence entry ${entry.name}`);
+        }
+        if (!entry.isDirectory() || !isSafeIdentifier(entry.name)) continue;
+        entryNames.push(entry.name);
+      }
+    });
+    entryNames.sort(compareCodeUnits);
+    for (const entryName of entryNames) {
+      const addressed = new EvidenceStore(runsRoot, experimentId, universeId, {
+        runId: entryName,
+      });
+      const candidate = await inspectEvidenceCandidate(addressed, entryName);
+      if (candidate.kind === "supported") candidates.push(addressed);
+    }
+
+    if (candidates.length !== 1) {
+      const available = candidates
+        .map((candidate) => candidate.runId ?? (legacyCandidate.kind === "missing"
+          ? "legacy"
+          : legacyCandidate.manifest.runId))
+        .join(", ");
+      const detail = available ? ` (${available})` : "";
+      if (candidates.length === 0) {
+        throw new EvidenceConflictError(
+          `No supported evidence runs found for ${experimentId}/${universeId}`,
+        );
+      }
+      throw new EvidenceConflictError(
+        `Multiple supported evidence runs found for ${experimentId}/${universeId}${detail}; specify --run-id`,
+      );
+    }
+    return candidates[0]!;
   }
 
   get events(): LabEventRecorder {
@@ -92,11 +218,14 @@ export class EvidenceStore {
    */
   async acquireWriterLease(runId: string): Promise<() => Promise<void>> {
     assertSafeIdentifier(runId, "lease run id");
-    await mkdir(this.directory, { recursive: true });
+    await ensureNoSymlinkDirectoryHierarchy(this.directory);
     const path = containedPath(this.directory, ".runner.lock");
-    let handle: Awaited<ReturnType<typeof open>>;
+    let handle: Awaited<ReturnType<typeof openRegularFileNoFollow>>;
     try {
-      handle = await open(path, "wx", 0o600);
+      handle = await openRegularFileNoFollow(
+        path,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+      );
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") {
         throw new EvidenceConflictError(
@@ -110,7 +239,7 @@ export class EvidenceStore {
       await handle.sync();
     } catch (error) {
       await handle.close().catch(() => undefined);
-      await unlink(path).catch(() => undefined);
+      await unlinkEntryNoFollow(path).catch(() => undefined);
       throw error;
     }
 
@@ -119,7 +248,7 @@ export class EvidenceStore {
       if (released) return;
       released = true;
       await handle.close();
-      await unlink(path);
+      await unlinkEntryNoFollow(path);
     };
   }
 
@@ -127,6 +256,9 @@ export class EvidenceStore {
     validateManifest(manifest);
     if (manifest.experimentId !== this.experimentId || manifest.universeId !== this.universeId) {
       throw new Error("Manifest does not match the evidence directory");
+    }
+    if (this.runId !== undefined && manifest.runId !== this.runId) {
+      throw new Error("Manifest run id does not match the evidence directory");
     }
     if (config.experimentId !== manifest.experimentId) {
       throw new Error("Config experiment does not match the manifest");
@@ -136,12 +268,14 @@ export class EvidenceStore {
       throw new Error(`Config hash mismatch: expected ${manifest.configHash}, got ${computedConfigHash}`);
     }
 
-    await mkdir(this.checkpointsDirectory, { recursive: true });
+    await ensureNoSymlinkDirectoryHierarchy(this.checkpointsDirectory);
     await this.#writeImmutable(this.manifestPath, manifest, "manifest");
     await this.#writeImmutable(this.configPath, config, "config");
     await ensureAppendFile(this.metricsPath);
     this.#lastMetricTick = lastMetricTick(await readCanonicalJsonl<MetricsSnapshot>(this.metricsPath));
-    this.#recorder = await LabEventRecorder.open(this.eventsPath, manifest);
+    this.#recorder = await LabEventRecorder.open(this.eventsPath, manifest, {
+      retainEvents: this.#retainEvents,
+    });
     return this.#recorder;
   }
 
@@ -183,6 +317,9 @@ export class EvidenceStore {
     if (manifest.experimentId !== this.experimentId || manifest.universeId !== this.universeId) {
       throw new Error("Stored manifest does not match its evidence directory");
     }
+    if (this.runId !== undefined && manifest.runId !== this.runId) {
+      throw new Error("Stored manifest run id does not match its evidence directory");
+    }
     return manifest;
   }
 
@@ -215,7 +352,11 @@ export class EvidenceStore {
   async readCheckpoints(): Promise<Checkpoint[]> {
     let entries: string[];
     try {
-      entries = await readdir(this.checkpointsDirectory);
+      entries = await withAnchoredDirectory(
+        this.checkpointsDirectory,
+        {},
+        (directory) => readdir(directory.path),
+      );
     } catch (error) {
       if (isMissing(error)) return [];
       throw error;
@@ -273,7 +414,7 @@ export class EvidenceStore {
   async #writeImmutable(path: string, value: unknown, label: string): Promise<void> {
     const serialized = canonicalJson(value);
     try {
-      const existing = await readFile(path, "utf8");
+      const existing = await readTextNoFollow(path);
       if (existing === serialized) return;
       throw new EvidenceConflictError(`Refusing to replace existing ${label}`);
     } catch (error) {
@@ -283,38 +424,166 @@ export class EvidenceStore {
   }
 }
 
+type CandidateInspection =
+  | { kind: "missing" }
+  | { kind: "supported"; manifest: RunManifest }
+  | { kind: "unsupported"; manifest: RunManifest; reason: string };
+
+async function validateDiscoveryHierarchy(store: EvidenceStore): Promise<boolean> {
+  const experimentDirectory = containedPath(store.runsRoot, store.experimentId);
+  for (const [path, label] of [
+    [store.runsRoot, "runs root"],
+    [experimentDirectory, "experiment directory"],
+    [containedPath(experimentDirectory, store.universeId), "universe directory"],
+  ] as const) {
+    try {
+      await withAnchoredDirectory(path, {}, async () => undefined);
+    } catch (error) {
+      if (isMissing(error)) return false;
+      if (error instanceof Error && /symbolic link|non-directory/.test(error.message)) {
+        throw new Error(`Refusing symbolic link or invalid ${label}`, { cause: error });
+      }
+      throw error;
+    }
+  }
+  return true;
+}
+
+async function inspectEvidenceCandidate(
+  store: EvidenceStore,
+  expectedRunId?: string,
+): Promise<CandidateInspection> {
+  try {
+    await withAnchoredDirectory(store.directory, {}, async (anchored) => {
+      let entryCount = 0;
+      const directory = await opendir(anchored.path);
+      for await (const entry of directory) {
+        entryCount += 1;
+        if (entryCount > MAX_DISCOVERY_ENTRIES) {
+          throw new Error(
+            `Evidence run exceeds the ${MAX_DISCOVERY_ENTRIES}-entry discovery limit: ${store.directory}`,
+          );
+        }
+        if (entry.isSymbolicLink()) {
+          throw new Error(`Refusing symbolic link evidence artifact ${entry.name}`);
+        }
+      }
+    });
+  } catch (error) {
+    if (isMissing(error)) return { kind: "missing" };
+    throw error;
+  }
+
+  let value: unknown;
+  try {
+    value = await readCanonicalJson<unknown>(store.manifestPath, MAX_MANIFEST_BYTES);
+  } catch (error) {
+    if (isMissing(error)) return { kind: "missing" };
+    if (error instanceof Error && error.message.includes(`${MAX_MANIFEST_BYTES}-byte read limit`)) {
+      throw new Error(
+        `Evidence manifest exceeds the ${MAX_MANIFEST_BYTES}-byte discovery limit: ${store.manifestPath}`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`Evidence manifest must be a JSON object: ${store.manifestPath}`);
+  }
+  const manifest = value as RunManifest;
+  assertSafeIdentifier(manifest.experimentId, "manifest experiment id");
+  assertSafeIdentifier(manifest.runId, "manifest run id");
+  assertSafeIdentifier(manifest.universeId, "manifest universe id");
+  if (manifest.experimentId !== store.experimentId || manifest.universeId !== store.universeId) {
+    throw new Error("Stored manifest does not match its evidence directory");
+  }
+  if (expectedRunId !== undefined && manifest.runId !== expectedRunId) {
+    throw new Error(
+      `Evidence directory ${expectedRunId} contains manifest for ${manifest.runId}`,
+    );
+  }
+  try {
+    assertLabManifestImplementation(manifest);
+  } catch (error) {
+    return {
+      kind: "unsupported",
+      manifest,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+  validateManifest(manifest);
+  return { kind: "supported", manifest };
+}
+
+function unsupportedImplementationError(
+  candidate: Extract<CandidateInspection, { kind: "unsupported" }>,
+): Error {
+  return new Error(
+    `Evidence run ${candidate.manifest.runId} has an unsupported implementation: ${candidate.reason}`,
+  );
+}
+
+function selectionError(
+  experimentId: string,
+  universeId: string,
+  runId: string | undefined,
+): Error {
+  if (runId !== undefined) {
+    return new Error(`Evidence run ${runId} was not found for ${experimentId}/${universeId}`);
+  }
+  return new EvidenceConflictError(
+    `No supported evidence run found for ${experimentId}/${universeId}`,
+  );
+}
+
+function isSafeIdentifier(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value) && !value.includes("..");
+}
+
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 let temporarySequence = 0;
 
 async function atomicCanonicalWrite(path: string, serialized: string): Promise<void> {
-  await mkdir(resolve(path, ".."), { recursive: true });
-  const temporary = `${path}.tmp-${process.pid}-${temporarySequence += 1}`;
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
-  try {
-    handle = await open(temporary, "wx", 0o600);
-    await handle.writeFile(serialized, "utf8");
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
+  await withAnchoredParentDirectory(path, { create: true }, async (directory, name) => {
+    const temporaryName = `${name}.tmp-${process.pid}-${temporarySequence += 1}`;
+    let handle: Awaited<ReturnType<typeof openRegularFileNoFollow>> | undefined;
     try {
-      // Atomic publication that can never replace already published evidence.
-      await link(temporary, path);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const concurrent = await readFile(path, "utf8");
-      if (concurrent !== serialized) {
-        throw new EvidenceConflictError("Concurrent immutable artifact conflicts with this run");
+      handle = await directory.openRegular(
+        temporaryName,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+      );
+      await handle.writeFile(serialized, "utf8");
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      try {
+        // Both names stay anchored to the same held directory descriptor.
+        await link(directory.entry(temporaryName), directory.entry(name));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const concurrent = await readTextFromAnchoredDirectory(directory, name);
+        if (concurrent !== serialized) {
+          throw new EvidenceConflictError("Concurrent immutable artifact conflicts with this run");
+        }
       }
+    } finally {
+      await handle?.close().catch(() => undefined);
+      await unlink(directory.entry(temporaryName)).catch((error: unknown) => {
+        if (!isMissing(error)) throw error;
+      });
     }
-  } catch (error) {
-    await handle?.close().catch(() => undefined);
-    await unlink(temporary).catch(() => undefined);
-    throw error;
-  }
-  await unlink(temporary);
+  });
 }
 
 async function appendCanonicalLine(path: string, value: unknown): Promise<void> {
-  const handle = await open(path, "a", 0o600);
+  await ensureNoSymlinkDirectoryHierarchy(dirname(path));
+  const handle = await openRegularFileNoFollow(
+    path,
+    constants.O_WRONLY | constants.O_APPEND,
+  );
   try {
     await handle.writeFile(`${canonicalJson(value)}\n`, "utf8");
     await handle.sync();
@@ -324,12 +593,16 @@ async function appendCanonicalLine(path: string, value: unknown): Promise<void> 
 }
 
 async function ensureAppendFile(path: string): Promise<void> {
-  const handle = await open(path, "a", 0o600);
+  await ensureNoSymlinkDirectoryHierarchy(dirname(path));
+  const handle = await openRegularFileNoFollow(
+    path,
+    constants.O_RDWR | constants.O_APPEND | constants.O_CREAT,
+  );
   await handle.close();
 }
 
-async function readCanonicalJson<T>(path: string): Promise<T> {
-  const text = await readFile(path, "utf8");
+async function readCanonicalJson<T>(path: string, maxBytes?: number): Promise<T> {
+  const text = await readTextNoFollow(path, maxBytes);
   let value: unknown;
   try {
     value = JSON.parse(text);
@@ -352,7 +625,7 @@ async function readOptionalCanonicalJson<T>(path: string): Promise<T | undefined
 async function readCanonicalJsonl<T>(path: string): Promise<T[]> {
   let text: string;
   try {
-    text = await readFile(path, "utf8");
+    text = await readTextNoFollow(path);
   } catch (error) {
     if (isMissing(error)) return [];
     throw error;
@@ -374,17 +647,69 @@ async function readCanonicalJsonl<T>(path: string): Promise<T[]> {
   return values;
 }
 
+async function readTextNoFollow(path: string, maxBytes?: number): Promise<string> {
+  const handle = await openRegularFileNoFollow(path, constants.O_RDONLY);
+  return readTextFromHandle(handle, path, maxBytes);
+}
+
+async function readTextFromAnchoredDirectory(
+  directory: AnchoredDirectory,
+  name: string,
+  maxBytes?: number,
+): Promise<string> {
+  const handle = await directory.openRegular(name, constants.O_RDONLY);
+  return readTextFromHandle(handle, `${directory.displayPath}/${name}`, maxBytes);
+}
+
+async function readTextFromHandle(
+  handle: Awaited<ReturnType<typeof openRegularFileNoFollow>>,
+  path: string,
+  maxBytes?: number,
+): Promise<string> {
+  try {
+    const bytes = maxBytes === undefined
+      ? await handle.readFile()
+      : await readBytesBounded(handle, maxBytes, path);
+    if (!isUtf8(bytes)) throw new Error(`Artifact is not valid UTF-8: ${path}`);
+    return bytes.toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readBytesBounded(
+  handle: Awaited<ReturnType<typeof openRegularFileNoFollow>>,
+  maxBytes: number,
+  path: string,
+): Promise<Buffer> {
+  const info = await handle.stat();
+  if (info.size > maxBytes) {
+    throw new Error(`Artifact exceeds the ${maxBytes}-byte read limit: ${path}`);
+  }
+  const chunks: Buffer[] = [];
+  let position = 0;
+  while (true) {
+    const remaining = maxBytes - position;
+    const buffer = Buffer.allocUnsafe(Math.min(65_536, remaining + 1));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+    if (bytesRead === 0) break;
+    position += bytesRead;
+    if (position > maxBytes) {
+      throw new Error(`Artifact exceeds the ${maxBytes}-byte read limit: ${path}`);
+    }
+    chunks.push(buffer.subarray(0, bytesRead));
+  }
+  return Buffer.concat(chunks, position);
+}
+
 function validateManifest(manifest: RunManifest): void {
   assertSafeIdentifier(manifest.experimentId, "manifest experiment id");
   assertSafeIdentifier(manifest.runId, "manifest run id");
   assertSafeIdentifier(manifest.universeId, "manifest universe id");
-  if (!manifest.seed) throw new Error("Manifest seed must not be empty");
-  if (manifest.engineVersion !== LAB_ENGINE_VERSION) throw new Error("Unsupported manifest engineVersion");
-  if (manifest.mode !== "logical") throw new Error("Unsupported manifest execution mode");
-  if (manifest.policyId !== LAB_POLICY_ID) throw new Error("Unsupported manifest policyId");
-  if (manifest.taskGeneratorId !== LAB_TASK_GENERATOR_ID) {
-    throw new Error("Unsupported manifest taskGeneratorId");
+  if (typeof manifest.seed !== "string" || manifest.seed.length === 0) {
+    throw new Error("Manifest seed must be a non-empty string");
   }
+  assertLabManifestImplementation(manifest);
   if (!/^[0-9a-f]{64}$/.test(manifest.configHash)) throw new Error("Manifest configHash must be lowercase SHA-256");
 }
 
@@ -415,8 +740,7 @@ function lastMetricTick(metrics: readonly MetricsSnapshot[]): number {
 function assertSafeIdentifier(value: string, label: string): void {
   if (
     typeof value !== "string"
-    || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)
-    || value.includes("..")
+    || !isSafeIdentifier(value)
   ) {
     throw new TypeError(`${label} is unsafe`);
   }

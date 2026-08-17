@@ -1,5 +1,6 @@
 import type { JsonObject, JsonValue } from "../core/types.js";
 import { compareCodeUnits } from "./canonical.js";
+import { LAB_POLICY_ID } from "./manifest.js";
 import { PPM, type LabAgentState, type Observation, type TaskObservation, type WorldAction } from "./types.js";
 
 export interface NeutralPolicyRandomSource {
@@ -19,6 +20,7 @@ export interface NeutralPolicyOptions {
  * so decisions are reproducible and independent of inter-agent call order.
  */
 export class NeutralPolicy {
+  readonly id = LAB_POLICY_ID;
   readonly #explorationPpm: number;
   readonly #streams = new Map<string, NeutralPolicyRandomSource>();
 

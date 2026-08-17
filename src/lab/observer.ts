@@ -1,5 +1,7 @@
 import { constants } from "node:fs";
-import { lstat, open, readdir, realpath } from "node:fs/promises";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { isUtf8 } from "node:buffer";
+import { lstat, open, readdir, realpath, type FileHandle } from "node:fs/promises";
 import {
   createServer,
   type IncomingMessage,
@@ -8,6 +10,7 @@ import {
 } from "node:http";
 import { join, relative, resolve, sep } from "node:path";
 import { compareCodeUnits } from "./canonical.js";
+import { MAX_LAB_EVENT_BYTES } from "./events.js";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 8787;
@@ -18,11 +21,18 @@ const MAX_SCAN_DEPTH = 8;
 const MAX_SCAN_ENTRIES = 20_000;
 const MAX_RUNS = 1_000;
 const MAX_JSON_ARTIFACT_BYTES = 1_048_576;
-const MAX_EVENT_LINE_BYTES = 262_144;
 const MAX_EVENT_SCAN_BYTES = 67_108_864;
 const MAX_EVENT_RESPONSE_BYTES = 4_194_304;
+const MAX_EVENT_INDEX_RUNS = 64;
+const MAX_EVENT_INDEX_ENTRIES = 2_048;
+const MAX_EVENT_INDEX_PROBES = 48;
+const EVENT_INDEX_SEEK_THRESHOLD_BYTES = 1_048_576;
+const EVENT_PROBE_CHUNK_BYTES = 65_536;
+const EVENT_INDEX_TAIL_ANCHOR_BYTES = 65_536;
+const MIN_AUTH_TOKEN_BYTES = 32;
+const MAX_AUTH_TOKEN_BYTES = 4_096;
 
-const RUN_ID_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
+const RUN_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 const REDACTED = "[REDACTED]";
 
 export interface ObserverServerOptions {
@@ -32,6 +42,8 @@ export interface ObserverServerOptions {
   host?: string;
   /** Used by startObserverServer. Defaults to 8787; zero requests an ephemeral port. */
   port?: number;
+  /** Optional Bearer token. When omitted, evidence routes are unauthenticated and must stay internal. */
+  authToken?: string;
 }
 
 interface RunRecord {
@@ -42,8 +54,146 @@ interface RunRecord {
 }
 
 interface RunDiscovery {
+  ambiguous: boolean;
   records: RunRecord[];
   truncated: boolean;
+}
+
+interface EventFileIdentity {
+  ctimeNs: bigint;
+  device: bigint;
+  inode: bigint;
+  mtimeNs: bigint;
+  size: bigint;
+}
+
+interface EventCheckpoint {
+  endOffset: number;
+  offset: number;
+  seq: number;
+}
+
+interface EventIndexEntry {
+  checkpoints: EventCheckpoint[];
+  headAnchor?: EventContentAnchor;
+  identity: EventFileIdentity;
+  tailAnchor?: EventContentAnchor;
+}
+
+interface EventIndexLease {
+  bytesRead: number;
+  entry: EventIndexEntry;
+}
+
+interface EventContentAnchor {
+  digest: string;
+  length: number;
+  offset: number;
+}
+
+interface EventProbe {
+  bytesRead: number;
+  checkpoint?: EventCheckpoint;
+}
+
+interface EventSeek {
+  bytesRead: number;
+  expectedFirstSeq: number;
+  startOffset: number;
+}
+
+class EventIndexCache {
+  readonly #entries = new Map<string, EventIndexEntry>();
+
+  async acquire(key: string, identity: EventFileIdentity, file: FileHandle): Promise<EventIndexLease> {
+    const existing = this.#entries.get(key);
+    if (existing !== undefined && sameEventFileIdentity(existing.identity, identity)) {
+      this.#touch(key, existing);
+      return { bytesRead: 0, entry: existing };
+    }
+    if (
+      existing !== undefined
+      && sameEventFileNode(existing.identity, identity)
+      && identity.size > existing.identity.size
+      && existing.headAnchor !== undefined
+      && existing.tailAnchor !== undefined
+    ) {
+      let headAnchor: EventContentAnchor;
+      let tailAnchor: EventContentAnchor;
+      try {
+        headAnchor = await readEventContentAnchor(
+          file,
+          existing.headAnchor.offset,
+          existing.headAnchor.length,
+        );
+        tailAnchor = existing.tailAnchor.offset === existing.headAnchor.offset
+          && existing.tailAnchor.length === existing.headAnchor.length
+          ? headAnchor
+          : await readEventContentAnchor(
+            file,
+            existing.tailAnchor.offset,
+            existing.tailAnchor.length,
+          );
+      } catch (error) {
+        if (this.#entries.get(key) === existing) this.#entries.delete(key);
+        throw error;
+      }
+      const bytesRead = headAnchor.length + (tailAnchor === headAnchor ? 0 : tailAnchor.length);
+      if (
+        headAnchor.digest === existing.headAnchor.digest
+        && tailAnchor.digest === existing.tailAnchor.digest
+      ) {
+        existing.identity = identity;
+        this.#touch(key, existing);
+        return { bytesRead, entry: existing };
+      }
+      if (this.#entries.get(key) === existing) this.#entries.delete(key);
+      return { bytesRead, entry: this.#create(key, identity) };
+    }
+    if (existing !== undefined) this.#entries.delete(key);
+    return { bytesRead: 0, entry: this.#create(key, identity) };
+  }
+
+  invalidate(key: string, expected?: EventIndexEntry): void {
+    if (expected === undefined || this.#entries.get(key) === expected) this.#entries.delete(key);
+  }
+
+  clear(): void {
+    this.#entries.clear();
+  }
+
+  async retainStable(
+    key: string,
+    expected: EventIndexEntry,
+    identity: EventFileIdentity,
+    file: FileHandle,
+  ): Promise<void> {
+    if (this.#entries.get(key) !== expected) return;
+    const anchorLength = Math.min(EVENT_INDEX_TAIL_ANCHOR_BYTES, Number(identity.size));
+    const anchorOffset = Number(identity.size) - anchorLength;
+    expected.headAnchor = await readEventContentAnchor(file, 0, anchorLength);
+    expected.tailAnchor = anchorOffset === 0
+      ? expected.headAnchor
+      : await readEventContentAnchor(file, anchorOffset, anchorLength);
+    expected.identity = identity;
+    this.#touch(key, expected);
+  }
+
+  #create(key: string, identity: EventFileIdentity): EventIndexEntry {
+    const created: EventIndexEntry = { checkpoints: [], identity };
+    this.#entries.set(key, created);
+    while (this.#entries.size > MAX_EVENT_INDEX_RUNS) {
+      const oldest = this.#entries.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.#entries.delete(oldest);
+    }
+    return created;
+  }
+
+  #touch(key: string, entry: EventIndexEntry): void {
+    this.#entries.delete(key);
+    this.#entries.set(key, entry);
+  }
 }
 
 class ObserverHttpError extends Error {
@@ -67,13 +217,15 @@ class ObserverHttpError extends Error {
  */
 export function createObserverServer(options: ObserverServerOptions): Server {
   const configuredDataDir = validateDataDir(options.dataDir);
+  const authHeaderDigest = createAuthHeaderDigest(options.authToken);
+  const eventIndexes = new EventIndexCache();
   const server = createServer(
     {
       maxHeaderSize: 16_384,
       requireHostHeader: true,
     },
     (request, response) => {
-      void handleRequest(configuredDataDir, request, response).catch((error: unknown) => {
+      void handleRequest(configuredDataDir, authHeaderDigest, eventIndexes, request, response).catch((error: unknown) => {
         if (response.headersSent || response.writableEnded) {
           response.destroy();
           return;
@@ -89,7 +241,7 @@ export function createObserverServer(options: ObserverServerOptions): Server {
 
   // Reject Expect: 100-continue without inviting a request body first.
   server.on("checkContinue", (request, response) => {
-    void handleRequest(configuredDataDir, request, response).catch((error: unknown) => {
+    void handleRequest(configuredDataDir, authHeaderDigest, eventIndexes, request, response).catch((error: unknown) => {
       if (response.headersSent || response.writableEnded) {
         response.destroy();
         return;
@@ -107,6 +259,10 @@ export function createObserverServer(options: ObserverServerOptions): Server {
   server.keepAliveTimeout = 5_000;
   server.maxHeadersCount = 100;
   server.maxRequestsPerSocket = 100;
+  server.on("close", () => {
+    eventIndexes.clear();
+    authHeaderDigest?.fill(0);
+  });
   return server;
 }
 
@@ -135,6 +291,8 @@ export async function startObserverServer(options: ObserverServerOptions): Promi
 
 async function handleRequest(
   configuredDataDir: string,
+  authHeaderDigest: Buffer | undefined,
+  eventIndexes: EventIndexCache,
   request: IncomingMessage,
   response: ServerResponse,
 ): Promise<void> {
@@ -192,9 +350,11 @@ async function handleRequest(
   }
 
   if (url.pathname === "/api/runs") {
+    if (!authorizeEvidenceRequest(request, response, authHeaderDigest)) return;
     ensureNoQuery(url);
     const root = await resolveDataRootOr503(configuredDataDir);
     const discovery = await discoverRuns(root);
+    assertCompleteRunDiscovery(discovery);
     const runs = [];
     for (const record of discovery.records) {
       let summary: Record<string, unknown> | null = null;
@@ -208,19 +368,20 @@ async function handleRequest(
     sendJson(response, 200, {
       count: runs.length,
       runs,
-      truncated: discovery.truncated,
+      truncated: false,
     });
     return;
   }
 
   const eventsMatch = /^\/api\/runs\/([^/]+)\/events$/.exec(url.pathname);
   if (eventsMatch !== null) {
+    if (!authorizeEvidenceRequest(request, response, authHeaderDigest)) return;
     const runId = decodeRunId(eventsMatch[1]);
     const { after, limit } = parseEventQuery(url);
     const root = await resolveDataRootOr503(configuredDataDir);
     const record = await findRun(root, runId);
     if (record === undefined) throw new ObserverHttpError(404, "run_not_found");
-    const page = await readEventPage(record, root, after, limit);
+    const page = await readEventPage(record, root, eventIndexes, after, limit);
     sendJson(response, 200, {
       runId,
       after,
@@ -234,6 +395,7 @@ async function handleRequest(
 
   const runMatch = /^\/api\/runs\/([^/]+)$/.exec(url.pathname);
   if (runMatch !== null) {
+    if (!authorizeEvidenceRequest(request, response, authHeaderDigest)) return;
     ensureNoQuery(url);
     const runId = decodeRunId(runMatch[1]);
     const root = await resolveDataRootOr503(configuredDataDir);
@@ -249,6 +411,41 @@ async function handleRequest(
   }
 
   sendJson(response, 404, { error: "not_found" });
+}
+
+function createAuthHeaderDigest(token: string | undefined): Buffer | undefined {
+  if (token === undefined) return undefined;
+  const tokenBytes = Buffer.byteLength(token, "utf8");
+  if (
+    tokenBytes < MIN_AUTH_TOKEN_BYTES
+    || tokenBytes > MAX_AUTH_TOKEN_BYTES
+    || !/^[A-Za-z0-9\-._~+/]+=*$/.test(token)
+  ) {
+    throw new TypeError(
+      `Observer auth token must be ${MIN_AUTH_TOKEN_BYTES}..${MAX_AUTH_TOKEN_BYTES} bytes of token68 data`,
+    );
+  }
+  return createHash("sha256").update(`Bearer ${token}`, "utf8").digest();
+}
+
+function authorizeEvidenceRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  expectedDigest: Buffer | undefined,
+): boolean {
+  if (expectedDigest === undefined) return true;
+
+  const authorizationValues = request.headersDistinct.authorization;
+  const candidate = authorizationValues?.length === 1 ? authorizationValues[0] ?? "" : "";
+  const candidateDigest = createHash("sha256").update(candidate, "utf8").digest();
+  const authorized = authorizationValues?.length === 1
+    && timingSafeEqual(candidateDigest, expectedDigest);
+  candidateDigest.fill(0);
+  if (authorized) return true;
+
+  response.setHeader("WWW-Authenticate", 'Bearer realm="anu-lab-observer"');
+  sendJson(response, 401, { error: "unauthorized" });
+  return false;
 }
 
 function sendJson(response: ServerResponse, status: number, value: unknown): void {
@@ -319,6 +516,7 @@ async function discoverRuns(root: string): Promise<RunDiscovery> {
       entries = await readdir(current.directory, { withFileTypes: true });
     } catch (error) {
       if (current.directory === root) throw error;
+      truncated = true;
       continue;
     }
     entries.sort((left, right) => compareCodeUnits(left.name, right.name));
@@ -345,28 +543,40 @@ async function discoverRuns(root: string): Promise<RunDiscovery> {
       } catch {
         // A malformed or oversized manifest is not evidence and is not listed.
       }
-      if (found.length >= MAX_RUNS) {
+      if (found.length > MAX_RUNS) {
         truncated = true;
         break;
       }
-      continue;
     }
 
     if (current.depth >= MAX_SCAN_DEPTH || entriesSeen >= MAX_SCAN_ENTRIES) {
       if (current.depth >= MAX_SCAN_DEPTH && entries.some((entry) => entry.isDirectory())) truncated = true;
+      if (entriesSeen >= MAX_SCAN_ENTRIES && entries.some((entry) => entry.isDirectory())) {
+        truncated = true;
+      }
       continue;
     }
 
     for (const entry of entries) {
-      if (!entry.isDirectory() || entry.isSymbolicLink() || entry.name.startsWith(".")) continue;
+      if (
+        !entry.isDirectory()
+        || entry.isSymbolicLink()
+        || entry.name.startsWith(".")
+        || entry.name === "populations"
+        || (manifestEntry !== undefined && entry.name === "checkpoints")
+      ) continue;
       const child = join(current.directory, entry.name);
       let canonicalChild: string;
       try {
         canonicalChild = await realpath(child);
       } catch {
+        truncated = true;
         continue;
       }
-      if (!isWithin(root, canonicalChild)) continue;
+      if (!isWithin(root, canonicalChild)) {
+        truncated = true;
+        continue;
+      }
       pending.push({
         directory: canonicalChild,
         depth: current.depth + 1,
@@ -385,22 +595,27 @@ async function discoverRuns(root: string): Promise<RunDiscovery> {
       : compareCodeUnits(left.relativeDirectory, right.relativeDirectory);
   });
 
-  const unique: RunRecord[] = [];
-  let previousRunId: string | undefined;
+  const occurrences = new Map<string, number>();
   for (const record of found) {
-    if (record.runId === previousRunId) {
-      truncated = true;
-      continue;
-    }
-    unique.push(record);
-    previousRunId = record.runId;
+    occurrences.set(record.runId, (occurrences.get(record.runId) ?? 0) + 1);
   }
-  return { records: unique, truncated };
+  const unique = found.filter((record) => occurrences.get(record.runId) === 1);
+  return { ambiguous: unique.length !== found.length, records: unique, truncated };
 }
 
 async function findRun(root: string, runId: string): Promise<RunRecord | undefined> {
   const discovery = await discoverRuns(root);
+  assertCompleteRunDiscovery(discovery);
   return discovery.records.find((record) => record.runId === runId);
+}
+
+function assertCompleteRunDiscovery(discovery: RunDiscovery): void {
+  if (discovery.truncated) {
+    throw new ObserverHttpError(503, "run_discovery_incomplete");
+  }
+  if (discovery.ambiguous) {
+    throw new ObserverHttpError(409, "ambiguous_run_evidence");
+  }
 }
 
 function readRunId(manifest: Record<string, unknown>): string | undefined {
@@ -479,7 +694,9 @@ async function readBoundedFile(
       offset += result.bytesRead;
     }
     if (offset > maxBytes) throw new ObserverHttpError(413, "artifact_too_large");
-    return buffer.subarray(0, offset).toString("utf8");
+    const content = buffer.subarray(0, offset);
+    if (!isUtf8(content)) throw new ObserverHttpError(422, "invalid_artifact");
+    return content.toString("utf8");
   } finally {
     await file.close();
   }
@@ -504,30 +721,39 @@ async function openSafeArtifact(directory: string, fileName: string, root: strin
 async function readEventPage(
   record: RunRecord,
   root: string,
+  eventIndexes: EventIndexCache,
   after: number,
   limit: number,
 ): Promise<{ events: Record<string, unknown>[]; nextAfter: number; hasMore: boolean }> {
+  const indexKey = join(record.directory, "events.jsonl");
   let file;
   try {
     file = await openSafeArtifact(record.directory, "events.jsonl", root);
   } catch (error) {
     if (isMissingFile(error)) {
+      eventIndexes.invalidate(indexKey);
       return { events: [], nextAfter: after, hasMore: false };
     }
     throw error;
   }
 
+  let index: EventIndexEntry | undefined;
+  let initialIdentity: EventFileIdentity | undefined;
   const selected: Record<string, unknown>[] = [];
   let selectedBytes = 0;
   let hasMore = false;
-  let scannedBytes = 0;
-  let pending = "";
-  let previousSeq = 0;
+  let scannedBytes: number;
+  let pending: Buffer = Buffer.alloc(0);
+  let pendingOffset: number;
+  let expectedSeq: number;
 
-  const consumeLine = (rawLine: string): boolean => {
-    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
-    if (line.length === 0) return false;
-    if (Buffer.byteLength(line, "utf8") > MAX_EVENT_LINE_BYTES) {
+  const consumeLine = (rawLine: Buffer, offset: number, endOffset: number): boolean => {
+    if (!isUtf8(rawLine) || rawLine.at(-1) === 0x0d) {
+      throw new ObserverHttpError(422, "invalid_event_log");
+    }
+    const line = rawLine.toString("utf8");
+    if (line.length === 0) throw new ObserverHttpError(422, "invalid_event_log");
+    if (Buffer.byteLength(line, "utf8") > MAX_LAB_EVENT_BYTES) {
       throw new ObserverHttpError(413, "event_line_too_large");
     }
 
@@ -537,11 +763,17 @@ async function readEventPage(
     } catch {
       throw new ObserverHttpError(422, "invalid_event_log");
     }
-    if (!isJsonObject(parsed) || !Number.isSafeInteger(parsed.seq) || (parsed.seq as number) <= previousSeq) {
+    if (
+      !isJsonObject(parsed)
+      || !Number.isSafeInteger(parsed.seq)
+      || (parsed.seq as number) !== expectedSeq
+    ) {
       throw new ObserverHttpError(422, "invalid_event_log");
     }
     const seq = parsed.seq as number;
-    previousSeq = seq;
+    expectedSeq = seq + 1;
+    if (index === undefined) throw new ObserverHttpError(500, "internal_error");
+    rememberEventCheckpoint(index, { endOffset, offset, seq });
     if (seq <= after) return false;
 
     if (selected.length >= limit) {
@@ -560,29 +792,60 @@ async function readEventPage(
   };
 
   try {
-    const info = await file.stat();
-    if (!info.isFile()) throw new ObserverHttpError(422, "invalid_event_log");
-    const stream = file.createReadStream({ autoClose: false, encoding: "utf8", highWaterMark: 65_536 });
-    for await (const chunk of stream) {
-      scannedBytes += Buffer.byteLength(chunk, "utf8");
+    initialIdentity = await eventFileIdentity(file);
+    const fileSize = Number(initialIdentity.size);
+    const terminatorBytes = await validateEventLogTerminator(file, fileSize);
+    const lease = await eventIndexes.acquire(indexKey, initialIdentity, file);
+    index = lease.entry;
+    const seek = await findEventScanStart(file, fileSize, after, index);
+    scannedBytes = terminatorBytes + lease.bytesRead + seek.bytesRead;
+    if (scannedBytes > MAX_EVENT_SCAN_BYTES) {
+      throw new ObserverHttpError(413, "event_scan_limit_exceeded");
+    }
+    pendingOffset = seek.startOffset;
+    expectedSeq = seek.expectedFirstSeq;
+
+    let readOffset = seek.startOffset;
+    while (readOffset < fileSize && !hasMore) {
+      const chunk = await readFileWindow(
+        file,
+        readOffset,
+        Math.min(EVENT_PROBE_CHUNK_BYTES, fileSize - readOffset),
+      );
+      if (chunk.length === 0) break;
+      readOffset += chunk.length;
+      scannedBytes += chunk.length;
       if (scannedBytes > MAX_EVENT_SCAN_BYTES) {
         throw new ObserverHttpError(413, "event_scan_limit_exceeded");
       }
-      pending += chunk;
+      pending = Buffer.concat([pending, chunk], pending.length + chunk.length);
 
-      let newline = pending.indexOf("\n");
+      let newline = pending.indexOf(0x0a);
       while (newline >= 0) {
-        const line = pending.slice(0, newline);
-        pending = pending.slice(newline + 1);
-        if (consumeLine(line)) break;
-        newline = pending.indexOf("\n");
+        const line = pending.subarray(0, newline);
+        const lineOffset = pendingOffset;
+        const lineEndOffset = lineOffset + newline + 1;
+        pending = pending.subarray(newline + 1);
+        pendingOffset = lineEndOffset;
+        if (consumeLine(line, lineOffset, lineEndOffset)) break;
+        newline = pending.indexOf(0x0a);
       }
       if (hasMore) break;
-      if (Buffer.byteLength(pending, "utf8") > MAX_EVENT_LINE_BYTES) {
+      if (pending.length > MAX_LAB_EVENT_BYTES + 1) {
         throw new ObserverHttpError(413, "event_line_too_large");
       }
     }
-    if (!hasMore && pending.length > 0) consumeLine(pending);
+    if (!hasMore && pending.length > 0) throw new ObserverHttpError(422, "invalid_event_log");
+
+    const finalIdentity = await eventFileIdentity(file);
+    if (!sameEventFileIdentity(initialIdentity, finalIdentity)) {
+      eventIndexes.invalidate(indexKey, index);
+    } else {
+      await eventIndexes.retainStable(indexKey, index, finalIdentity, file);
+    }
+  } catch (error) {
+    eventIndexes.invalidate(indexKey, index);
+    throw error;
   } finally {
     await file.close();
   }
@@ -592,6 +855,246 @@ async function readEventPage(
     nextAfter: selected.length === 0 ? after : (selected.at(-1)?.seq as number),
     hasMore,
   };
+}
+
+async function eventFileIdentity(file: FileHandle): Promise<EventFileIdentity> {
+  const info = await file.stat({ bigint: true });
+  if (!info.isFile()) throw new ObserverHttpError(422, "invalid_event_log");
+  if (info.size > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new ObserverHttpError(413, "event_scan_limit_exceeded");
+  }
+  return {
+    ctimeNs: info.ctimeNs,
+    device: info.dev,
+    inode: info.ino,
+    mtimeNs: info.mtimeNs,
+    size: info.size,
+  };
+}
+
+async function validateEventLogTerminator(file: FileHandle, fileSize: number): Promise<number> {
+  if (fileSize === 0) return 0;
+  const terminator = await readFileWindow(file, fileSize - 1, 1);
+  if (terminator.length !== 1 || terminator[0] !== 0x0a) {
+    throw new ObserverHttpError(422, "invalid_event_log");
+  }
+  return 1;
+}
+
+async function readEventContentAnchor(
+  file: FileHandle,
+  offset: number,
+  length: number,
+): Promise<EventContentAnchor> {
+  const content = await readFileWindow(file, offset, length);
+  if (content.length !== length) throw new ObserverHttpError(422, "invalid_event_log");
+  return {
+    digest: createHash("sha256").update(content).digest("hex"),
+    length,
+    offset,
+  };
+}
+
+function sameEventFileIdentity(left: EventFileIdentity, right: EventFileIdentity): boolean {
+  return left.ctimeNs === right.ctimeNs
+    && left.device === right.device
+    && left.inode === right.inode
+    && left.mtimeNs === right.mtimeNs
+    && left.size === right.size;
+}
+
+function sameEventFileNode(left: EventFileIdentity, right: EventFileIdentity): boolean {
+  return left.device === right.device && left.inode === right.inode;
+}
+
+function rememberEventCheckpoint(index: EventIndexEntry, checkpoint: EventCheckpoint): void {
+  let low = 0;
+  let high = index.checkpoints.length;
+  while (low < high) {
+    const middle = low + Math.floor((high - low) / 2);
+    const existing = index.checkpoints[middle];
+    if (existing === undefined || existing.offset < checkpoint.offset) low = middle + 1;
+    else high = middle;
+  }
+
+  const sameOffset = index.checkpoints[low];
+  if (sameOffset?.offset === checkpoint.offset) {
+    if (sameOffset.endOffset !== checkpoint.endOffset || sameOffset.seq !== checkpoint.seq) {
+      throw new ObserverHttpError(422, "invalid_event_log");
+    }
+    return;
+  }
+
+  const previous = index.checkpoints[low - 1];
+  const next = index.checkpoints[low];
+  if (
+    checkpoint.offset < 0
+    || checkpoint.endOffset <= checkpoint.offset
+    || (previous !== undefined && (previous.endOffset > checkpoint.offset || previous.seq >= checkpoint.seq))
+    || (next !== undefined && (checkpoint.endOffset > next.offset || checkpoint.seq >= next.seq))
+  ) {
+    throw new ObserverHttpError(422, "invalid_event_log");
+  }
+
+  index.checkpoints.splice(low, 0, checkpoint);
+  if (index.checkpoints.length <= MAX_EVENT_INDEX_ENTRIES) return;
+
+  const checkpoints = index.checkpoints;
+  const compacted: EventCheckpoint[] = [];
+  for (let position = 0; position < MAX_EVENT_INDEX_ENTRIES; position += 1) {
+    const source = Math.floor((position * (checkpoints.length - 1)) / (MAX_EVENT_INDEX_ENTRIES - 1));
+    const retained = checkpoints[source];
+    if (retained !== undefined) compacted.push(retained);
+  }
+  index.checkpoints = compacted;
+}
+
+async function findEventScanStart(
+  file: FileHandle,
+  fileSize: number,
+  after: number,
+  index: EventIndexEntry,
+): Promise<EventSeek> {
+  if (after === 0 || fileSize === 0) {
+    return { bytesRead: 0, expectedFirstSeq: 1, startOffset: 0 };
+  }
+
+  let floor: EventCheckpoint | undefined;
+  let ceiling: EventCheckpoint | undefined;
+  for (const checkpoint of index.checkpoints) {
+    if (checkpoint.seq <= after) floor = checkpoint;
+    else {
+      ceiling = checkpoint;
+      break;
+    }
+  }
+
+  let lowOffset = floor?.endOffset ?? 0;
+  let highOffset = ceiling?.offset ?? fileSize;
+  if (floor === undefined && highOffset <= EVENT_INDEX_SEEK_THRESHOLD_BYTES) {
+    return { bytesRead: 0, expectedFirstSeq: 1, startOffset: 0 };
+  }
+
+  let bytesRead = 0;
+  for (
+    let probeCount = 0;
+    probeCount < MAX_EVENT_INDEX_PROBES
+      && highOffset - lowOffset > EVENT_INDEX_SEEK_THRESHOLD_BYTES;
+    probeCount += 1
+  ) {
+    const targetOffset = lowOffset + Math.floor((highOffset - lowOffset) / 2);
+    const probe = await probeEventCheckpoint(file, targetOffset, fileSize);
+    bytesRead += probe.bytesRead;
+    if (bytesRead > MAX_EVENT_SCAN_BYTES) {
+      throw new ObserverHttpError(413, "event_scan_limit_exceeded");
+    }
+
+    const checkpoint = probe.checkpoint;
+    if (checkpoint === undefined) {
+      highOffset = targetOffset;
+      continue;
+    }
+    rememberEventCheckpoint(index, checkpoint);
+
+    if (checkpoint.seq <= after) {
+      if (floor === undefined || checkpoint.seq > floor.seq) floor = checkpoint;
+      lowOffset = Math.max(lowOffset + 1, checkpoint.endOffset);
+    } else {
+      ceiling = checkpoint;
+      highOffset = checkpoint.offset <= lowOffset ? lowOffset : checkpoint.offset;
+    }
+  }
+
+  return {
+    bytesRead,
+    expectedFirstSeq: floor?.seq ?? 1,
+    startOffset: floor?.offset ?? 0,
+  };
+}
+
+async function probeEventCheckpoint(
+  file: FileHandle,
+  targetOffset: number,
+  fileSize: number,
+): Promise<EventProbe> {
+  if (fileSize === 0 || targetOffset >= fileSize) return { bytesRead: 0 };
+
+  let bytesRead = 0;
+  let lineStart = 0;
+  let cursor = targetOffset;
+  let searchedBackward = 0;
+  while (cursor > 0) {
+    const remainingAllowance = MAX_LAB_EVENT_BYTES + 2 - searchedBackward;
+    if (remainingAllowance <= 0) throw new ObserverHttpError(413, "event_line_too_large");
+    const length = Math.min(EVENT_PROBE_CHUNK_BYTES, cursor, remainingAllowance);
+    const position = cursor - length;
+    const chunk = await readFileWindow(file, position, length);
+    bytesRead += chunk.length;
+    const newline = chunk.lastIndexOf(0x0a);
+    if (newline >= 0) {
+      lineStart = position + newline + 1;
+      break;
+    }
+    searchedBackward += chunk.length;
+    cursor = position;
+    if (chunk.length < length) throw new ObserverHttpError(422, "invalid_event_log");
+  }
+
+  let nextLineStart = lineStart;
+  while (nextLineStart < fileSize) {
+    const length = Math.min(MAX_LAB_EVENT_BYTES + 3, fileSize - nextLineStart);
+    const chunk = await readFileWindow(file, nextLineStart, length);
+    bytesRead += chunk.length;
+    if (bytesRead > MAX_EVENT_SCAN_BYTES) {
+      throw new ObserverHttpError(413, "event_scan_limit_exceeded");
+    }
+
+    const newline = chunk.indexOf(0x0a);
+    const rawLength = newline >= 0 ? newline : chunk.length;
+    if (newline < 0 && nextLineStart + chunk.length < fileSize) {
+      throw new ObserverHttpError(413, "event_line_too_large");
+    }
+    const raw = chunk.subarray(0, rawLength);
+    if (!isUtf8(raw) || raw.at(-1) === 0x0d) {
+      throw new ObserverHttpError(422, "invalid_event_log");
+    }
+    const line = raw.toString("utf8");
+    if (Buffer.byteLength(line, "utf8") > MAX_LAB_EVENT_BYTES) {
+      throw new ObserverHttpError(413, "event_line_too_large");
+    }
+    const endOffset = nextLineStart + rawLength + (newline >= 0 ? 1 : 0);
+    if (line.length === 0) throw new ObserverHttpError(422, "invalid_event_log");
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line) as unknown;
+    } catch {
+      throw new ObserverHttpError(422, "invalid_event_log");
+    }
+    if (!isJsonObject(parsed) || !Number.isSafeInteger(parsed.seq) || (parsed.seq as number) <= 0) {
+      throw new ObserverHttpError(422, "invalid_event_log");
+    }
+    return {
+      bytesRead,
+      checkpoint: {
+        endOffset,
+        offset: nextLineStart,
+        seq: parsed.seq as number,
+      },
+    };
+  }
+  return { bytesRead };
+}
+
+async function readFileWindow(file: FileHandle, position: number, length: number): Promise<Buffer> {
+  const buffer = Buffer.allocUnsafe(length);
+  let offset = 0;
+  while (offset < length) {
+    const result = await file.read(buffer, offset, length - offset, position + offset);
+    if (result.bytesRead === 0) break;
+    offset += result.bytesRead;
+  }
+  return buffer.subarray(0, offset);
 }
 
 function parseEventQuery(url: URL): { after: number; limit: number } {
@@ -692,6 +1195,8 @@ function isSensitiveKey(key: string): boolean {
     || normalized === "proxyauthorization"
     || normalized === "cookie"
     || normalized === "setcookie"
+    || normalized.endsWith("token")
+    || normalized.endsWith("jwt")
     || normalized.endsWith("apikey")
     || normalized.endsWith("accesstoken")
     || normalized.endsWith("refreshtoken")
@@ -702,9 +1207,12 @@ function isSensitiveKey(key: string): boolean {
 function redactString(value: string): string {
   return value
     .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [REDACTED]")
-    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/gi, "$1[REDACTED]@")
     .replace(
-      /(api[_-]?key|client[_-]?secret|password|passwd|access[_-]?token|refresh[_-]?token|authorization)(\s*[=:]\s*)[^\s,;&]+/gi,
+      /(^|[^a-z0-9+.-])([a-z][a-z0-9+.-]*:\/\/)[^/@\s]+@/gi,
+      "$1$2[REDACTED]@",
+    )
+    .replace(
+      /(api[_-]?key|client[_-]?secret|password|passwd|(?:access|refresh|session|auth|csrf|bearer|api)?[_-]?token|jwt|authorization)(\s*[=:]\s*)[^\s,;&]+/gi,
       "$1$2[REDACTED]",
     );
 }

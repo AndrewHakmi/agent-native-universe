@@ -1,8 +1,14 @@
-import { readFile } from "node:fs/promises";
 import { hashValue } from "./canonical.js";
-import { deserializeEventJsonl, initialEventHash, verifyEventChain } from "./events.js";
-import { initialWorldState, reduceWorldEvent } from "./reducer.js";
-import type { LabEvent, RunManifest, WorldState } from "./types.js";
+import { iterateEventFile } from "./event-stream.js";
+import {
+  initialEventChainVerification,
+  initialEventHash,
+  verifyNextEvent,
+} from "./events.js";
+import { assertLabManifestImplementation } from "./manifest.js";
+import { LabProtocolVerifier } from "./protocol-verifier.js";
+import { applyWorldEventMutable, initialWorldState } from "./reducer.js";
+import type { GenesisConfig, LabEvent, RunManifest, WorldState } from "./types.js";
 
 export interface ReplayResult {
   state: WorldState;
@@ -14,44 +20,108 @@ export interface ReplayResult {
   lastTick: number;
 }
 
-/** Replay is deliberately projection-only: it imports neither policy nor evaluator. */
+/** Replay verifies the complete deterministic protocol before returning its projection. */
 export class ReplayEngine {
-  static replay(events: readonly LabEvent[], manifest: RunManifest, untilTick?: number): ReplayResult {
-    if (untilTick !== undefined && (!Number.isSafeInteger(untilTick) || untilTick < 0)) {
-      throw new RangeError("untilTick must be a non-negative safe integer");
-    }
-    verifyEventChain(events, manifest);
-    let state = initialWorldState(manifest);
+  static replay(
+    events: readonly LabEvent[],
+    manifest: RunManifest,
+    config: GenesisConfig,
+    untilTick?: number,
+  ): ReplayResult {
+    assertLabManifestImplementation(manifest);
+    validateUntilTick(untilTick);
+    const protocol = new LabProtocolVerifier(manifest, config);
+    let verification = initialEventChainVerification(manifest);
+    const state = initialWorldState(manifest);
+    let outputState: WorldState | undefined;
     let eventsApplied = 0;
     let finalEventHash = initialEventHash(manifest);
     let lastSeq = 0;
 
     for (const event of events) {
-      if (untilTick !== undefined && event.tick > untilTick) break;
-      state = reduceWorldEvent(state, event);
-      eventsApplied += 1;
-      finalEventHash = event.hash;
-      lastSeq = event.seq;
+      verification = verifyNextEvent(event, manifest, verification);
+      if (untilTick !== undefined && event.tick > untilTick && outputState === undefined) {
+        outputState = structuredClone(state);
+      }
+      protocol.verifyNext(event, state);
+      applyWorldEventMutable(state, event);
+      if (untilTick === undefined || event.tick <= untilTick) {
+        eventsApplied += 1;
+        finalEventHash = event.hash;
+        lastSeq = event.seq;
+      }
     }
+    protocol.finish();
 
-    const digest = hashValue(state);
+    const projected = outputState ?? state;
+    const digest = hashValue(projected);
     return {
-      state,
+      state: projected,
       digest,
       stateHash: digest,
       finalEventHash,
       eventsApplied,
       lastSeq,
-      lastTick: state.tick,
+      lastTick: projected.tick,
     };
   }
 
-  static async replayFile(path: string, manifest: RunManifest, untilTick?: number): Promise<ReplayResult> {
-    const events = deserializeEventJsonl(await readFile(path, "utf8"));
-    return ReplayEngine.replay(events, manifest, untilTick);
+  static async replayFile(
+    path: string,
+    manifest: RunManifest,
+    config: GenesisConfig,
+    untilTick?: number,
+  ): Promise<ReplayResult> {
+    assertLabManifestImplementation(manifest);
+    validateUntilTick(untilTick);
+    const protocol = new LabProtocolVerifier(manifest, config);
+    let verification = initialEventChainVerification(manifest);
+    const state = initialWorldState(manifest);
+    let outputState: WorldState | undefined;
+    let eventsApplied = 0;
+    let finalEventHash = initialEventHash(manifest);
+    let lastSeq = 0;
+
+    for await (const event of iterateEventFile(path)) {
+      verification = verifyNextEvent(event, manifest, verification);
+      if (untilTick !== undefined && event.tick > untilTick && outputState === undefined) {
+        outputState = structuredClone(state);
+      }
+      protocol.verifyNext(event, state);
+      applyWorldEventMutable(state, event);
+      if (untilTick === undefined || event.tick <= untilTick) {
+        eventsApplied += 1;
+        finalEventHash = event.hash;
+        lastSeq = event.seq;
+      }
+    }
+    protocol.finish();
+
+    const projected = outputState ?? state;
+    const digest = hashValue(projected);
+    return {
+      state: projected,
+      digest,
+      stateHash: digest,
+      finalEventHash,
+      eventsApplied,
+      lastSeq,
+      lastTick: projected.tick,
+    };
   }
 }
 
-export function replayEvents(events: readonly LabEvent[], manifest: RunManifest, untilTick?: number): ReplayResult {
-  return ReplayEngine.replay(events, manifest, untilTick);
+export function replayEvents(
+  events: readonly LabEvent[],
+  manifest: RunManifest,
+  config: GenesisConfig,
+  untilTick?: number,
+): ReplayResult {
+  return ReplayEngine.replay(events, manifest, config, untilTick);
+}
+
+function validateUntilTick(untilTick: number | undefined): void {
+  if (untilTick !== undefined && (!Number.isSafeInteger(untilTick) || untilTick < 0)) {
+    throw new RangeError("untilTick must be a non-negative safe integer");
+  }
 }

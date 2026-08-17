@@ -105,6 +105,7 @@ export interface LabAgentState {
   generation: number;
   lineage: string[];
   resources: ResourceVector;
+  inbox: string[];
   memory: Record<string, JsonValue>;
   learning: AgentLearningState;
   actionCounts: Partial<Record<PrimitiveActionType, number>>;
@@ -133,6 +134,8 @@ export interface LabTaskState {
   claimedBy?: string;
   submittedBy?: string;
   completedTick?: number;
+  /** Event that completed the task; retained so rewards/attestations have a verifiable parent. */
+  evaluationEventId?: string;
 }
 
 export interface SubmissionState {
@@ -141,10 +144,45 @@ export interface SubmissionState {
   agentId: string;
   result: JsonValue;
   submittedTick: number;
+  submittedSeq: number;
+  submittedEventId: string;
   accepted: boolean;
   qualityPpm: number;
   latencyTicks: number;
 }
+
+export interface MessageState {
+  id: string;
+  senderId: string;
+  recipientId: string;
+  payload: JsonObject;
+  sentTick: number;
+  sentSeq: number;
+  sentEventId: string;
+  linkId: string;
+  localIndex: number;
+  deliveredTick?: number;
+  deliveredSeq?: number;
+  deliveredEventId?: string;
+  linkUsedEventId?: string;
+}
+
+/** A public attestation. It is deliberately separate from evaluator truth. */
+export interface VerificationState {
+  id: string;
+  submissionId: string;
+  verifierId: string;
+  computedResult: JsonValue;
+  verdict: boolean;
+  matchesSubmission: boolean;
+  createdTick: number;
+}
+
+export type CapabilityPlanStep =
+  | { op: "copy"; from: string; to: string }
+  | { op: "sum"; inputs: string[]; output: string }
+  | { op: "concat"; inputs: string[]; output: string; separator: string }
+  | { op: "literal"; output: string; value: JsonValue };
 
 export interface CapabilityState {
   id: string;
@@ -153,11 +191,27 @@ export interface CapabilityState {
   inputs: string[];
   outputs: string[];
   primitivePlan: PrimitiveActionType[];
+  executionPlan: CapabilityPlanStep[];
   tests: JsonValue[];
   cost: ResourceVector;
   createdTick: number;
   usageCount: number;
   successCount: number;
+}
+
+export interface CapabilityInvocationState {
+  id: string;
+  capabilityId: string;
+  callerId: string;
+  input: JsonValue;
+  accepted: boolean;
+  success: boolean;
+  chargedCost: ResourceVector;
+  createdTick: number;
+  localIndex: number;
+  output?: JsonValue;
+  paymentTo?: string;
+  reason?: string;
 }
 
 export interface PhysicsState {
@@ -173,11 +227,16 @@ export interface WorldState {
   configHash: string;
   seed: string;
   tick: number;
+  started: boolean;
   agents: Record<string, LabAgentState>;
   links: Record<string, LabLinkState>;
   tasks: Record<string, LabTaskState>;
   submissions: Record<string, SubmissionState>;
+  submissionOrder: string[];
+  verifications: Record<string, VerificationState>;
+  messages: Record<string, MessageState>;
   capabilities: Record<string, CapabilityState>;
+  capabilityInvocations: Record<string, CapabilityInvocationState>;
   physics: PhysicsState;
   treasury: ResourceVector;
   resourceSpent: ResourceVector;
@@ -195,14 +254,35 @@ export interface TaskObservation {
   claimedBy?: string;
 }
 
+export interface SubmissionObservation {
+  id: string;
+  taskId: string;
+  agentId: string;
+  result: JsonValue;
+  submittedTick: number;
+  task: TaskObservation;
+}
+
+export interface MessageObservation {
+  id: string;
+  senderId: string;
+  recipientId: string;
+  payload: JsonObject;
+  sentTick: number;
+  deliveredTick: number;
+  redactedPaths: string[];
+}
+
 export interface Observation {
   tick: number;
   agentId: string;
   resources: ResourceVector;
   tasks: TaskObservation[];
+  submissions: SubmissionObservation[];
+  inbox: MessageObservation[];
   visibleAgents: string[];
   neighbors: string[];
-  capabilities: Array<Pick<CapabilityState, "id" | "ownerId" | "inputs" | "outputs" | "cost">>;
+  capabilities: Array<Pick<CapabilityState, "id" | "ownerId" | "inputs" | "outputs" | "tests" | "cost">>;
   physics: PhysicsState;
 }
 
@@ -212,7 +292,7 @@ export type WorldAction =
   | { type: "claimTask"; taskId: string }
   | { type: "execute"; taskId: string; result: JsonValue }
   | { type: "submit"; taskId: string; result: JsonValue }
-  | { type: "verify"; submissionId: string }
+  | { type: "verify"; submissionId: string; computedResult: JsonValue; verdict: boolean }
   | { type: "send"; targetId: string; payload: JsonObject }
   | { type: "connect"; targetId: string }
   | { type: "disconnect"; targetId: string }
@@ -220,7 +300,7 @@ export type WorldAction =
   | { type: "retrieve"; key: string }
   | {
       type: "publishCapability";
-      capability: Pick<CapabilityState, "id" | "inputs" | "outputs" | "primitivePlan" | "tests" | "cost">;
+      capability: Pick<CapabilityState, "id" | "inputs" | "outputs" | "primitivePlan" | "executionPlan" | "tests" | "cost">;
     }
   | { type: "useCapability"; capabilityId: string; input: JsonValue }
   | { type: "transfer"; targetId: string; resource: ResourceKind; amount: number }
@@ -278,6 +358,7 @@ export type LabEventType =
   | "task.claimed"
   | "task.submitted"
   | "task.evaluated"
+  | "submission.verified"
   | "task.expired"
   | "link.created"
   | "link.removed"
@@ -287,6 +368,7 @@ export type LabEventType =
   | "memory.stored"
   | "memory.retrieved"
   | "message.sent"
+  | "message.delivered"
   | "capability.published"
   | "capability.used"
   | "agent.learning.updated"

@@ -1,13 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { canonicalJson } from "../dist/lab/canonical.js";
 import { DEFAULT_GENESIS_CONFIG } from "../dist/lab/config.js";
 import { runGenesis } from "../dist/lab/genesis.js";
 import { populationSeed } from "../dist/lab/manifest.js";
 import {
+  createPopulationId,
   MAX_POPULATION_PARALLELISM,
   PopulationRunError,
   populationSummaryPath,
@@ -45,9 +46,13 @@ test("Genesis persists metrics and checkpoints, then proves final replay equival
   const runsRoot = await temporaryRoot(t);
   const config = testConfig("genesis-orchestration");
   const summary = await runGenesis({ config, runsRoot, universeId: "U0001" });
-  const directory = join(runsRoot, config.experimentId, "U0001");
+  const directory = join(runsRoot, config.experimentId, "U0001", summary.runId);
   const manifest = JSON.parse(await readFile(join(directory, "manifest.json"), "utf8"));
-  const replay = await ReplayEngine.replayFile(join(directory, "events.jsonl"), manifest);
+  const replay = await ReplayEngine.replayFile(
+    join(directory, "events.jsonl"),
+    manifest,
+    config,
+  );
 
   assert.equal(replay.stateHash, summary.finalStateHash);
   assert.equal(replay.finalEventHash, summary.finalEventHash);
@@ -94,10 +99,193 @@ test("parallel scheduling cannot change per-universe scientific hashes", async (
   for (const summary of serial.universes) {
     assert.equal(summary.seed, populationSeed(config.seed, summary.universeId));
   }
+  const populationId = createPopulationId(config, 4);
   assert.equal(
-    await readFile(populationSummaryPath(serialRoot, config.experimentId), "utf8"),
+    await readFile(
+      populationSummaryPath(serialRoot, config.experimentId, populationId),
+      "utf8",
+    ),
     canonicalJson(serial),
   );
+});
+
+test("distinct population inputs coexist and an identical rerun is idempotent", async (t) => {
+  const runsRoot = await temporaryRoot(t);
+  const firstConfig = testConfig("population-catalog-first");
+  const secondConfig = testConfig("population-catalog-second");
+
+  const first = await runPopulation({
+    config: firstConfig,
+    runsRoot,
+    universes: 2,
+    parallel: 1,
+  });
+  const firstId = createPopulationId(firstConfig, 2);
+  const firstPath = populationSummaryPath(runsRoot, firstConfig.experimentId, firstId);
+  const firstBytes = await readFile(firstPath, "utf8");
+
+  const second = await runPopulation({
+    config: secondConfig,
+    runsRoot,
+    universes: 2,
+    parallel: 2,
+  });
+  const secondId = createPopulationId(secondConfig, 2);
+  const secondPath = populationSummaryPath(runsRoot, secondConfig.experimentId, secondId);
+
+  assert.notEqual(firstId, secondId);
+  assert.notEqual(firstId, createPopulationId(firstConfig, 1));
+  assert.equal(firstId, createPopulationId(structuredClone(firstConfig), 2));
+  assert.equal(firstBytes, canonicalJson(first));
+  assert.equal(await readFile(secondPath, "utf8"), canonicalJson(second));
+  assert.deepEqual(
+    (await readdir(join(runsRoot, firstConfig.experimentId, "populations"))).sort(),
+    [firstId, secondId].sort(),
+  );
+
+  const repeated = await runPopulation({
+    config: firstConfig,
+    runsRoot,
+    universes: 2,
+    parallel: 2,
+  });
+  assert.deepEqual(repeated, first);
+  assert.equal(await readFile(firstPath, "utf8"), firstBytes);
+  assert.equal(
+    populationSummaryPath(runsRoot, firstConfig.experimentId),
+    join(runsRoot, firstConfig.experimentId, "population.json"),
+    "the two-argument helper remains a legacy-read path",
+  );
+});
+
+test("an injected runner cannot publish a forged summary over valid universe evidence", async (t) => {
+  const runsRoot = await temporaryRoot(t);
+  const config = testConfig("population-forged-summary");
+  let authenticSummary;
+  const forgedExecutor = async (options) => {
+    authenticSummary = await runGenesis(options);
+    return {
+      ...authenticSummary,
+      events: authenticSummary.events + 1,
+      finalStateHash: "f".repeat(64),
+    };
+  };
+
+  await assert.rejects(
+    runPopulation({
+      config,
+      runsRoot,
+      universes: 1,
+      runUniverse: forgedExecutor,
+    }),
+    (error) => {
+      assert.ok(error instanceof PopulationRunError);
+      assert.equal(error.failures.length, 1);
+      assert.match(error.failures[0].cause.message, /summary does not match verified evidence/);
+      return true;
+    },
+  );
+  assert.ok(authenticSummary);
+
+  const populationId = createPopulationId(config, 1);
+  const path = populationSummaryPath(runsRoot, config.experimentId, populationId);
+  await assert.rejects(
+    readFile(path, "utf8"),
+    (error) => error.code === "ENOENT",
+  );
+  assert.deepEqual(
+    JSON.parse(await readFile(
+      join(
+        runsRoot,
+        config.experimentId,
+        authenticSummary.universeId,
+        authenticSummary.runId,
+        "summary.json",
+      ),
+      "utf8",
+    )),
+    authenticSummary,
+  );
+
+  const verified = await runPopulation({
+    config,
+    runsRoot,
+    universes: 1,
+    runUniverse: runGenesis,
+  });
+  assert.deepEqual(verified.universes, [authenticSummary]);
+  assert.equal(await readFile(path, "utf8"), canonicalJson(verified));
+});
+
+test("an injected runner cannot mutate its per-universe scientific identity", async (t) => {
+  const runsRoot = await temporaryRoot(t);
+  const config = testConfig("population-immutable-input");
+
+  await assert.rejects(
+    runPopulation({
+      config,
+      runsRoot,
+      universes: 1,
+      runUniverse: async (options) => {
+        options.config.seed = "executor-mutated-seed";
+        return runGenesis(options);
+      },
+    }),
+    (error) => {
+      assert.ok(error instanceof PopulationRunError);
+      assert.match(error.failures[0].cause.message, /wrong run id/);
+      return true;
+    },
+  );
+  const populationId = createPopulationId(config, 1);
+  await assert.rejects(
+    readFile(populationSummaryPath(runsRoot, config.experimentId, populationId), "utf8"),
+    (error) => error.code === "ENOENT",
+  );
+});
+
+test("population publication refuses a symbolic-link directory hierarchy", async (t) => {
+  const runsRoot = await temporaryRoot(t);
+  const outside = await temporaryRoot(t);
+  const config = testConfig("population-symlink");
+  await mkdir(join(runsRoot, config.experimentId), { recursive: true });
+  await symlink(outside, join(runsRoot, config.experimentId, "populations"), "dir");
+
+  await assert.rejects(
+    runPopulation({
+      config,
+      runsRoot,
+      universes: 1,
+    }),
+    /Refusing symbolic link/,
+  );
+  const populationId = createPopulationId(config, 1);
+  await assert.rejects(
+    readFile(join(outside, populationId, "population.json"), "utf8"),
+    (error) => error.code === "ENOENT",
+  );
+});
+
+test("population publication refuses a symbolic-link destination", async (t) => {
+  const runsRoot = await temporaryRoot(t);
+  const outside = await temporaryRoot(t);
+  const config = testConfig("population-file-symlink");
+  const populationId = createPopulationId(config, 1);
+  const path = populationSummaryPath(runsRoot, config.experimentId, populationId);
+  const outsideFile = join(outside, "protected.json");
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(outsideFile, "protected", "utf8");
+  await symlink(outsideFile, path, "file");
+
+  await assert.rejects(
+    runPopulation({
+      config,
+      runsRoot,
+      universes: 1,
+    }),
+    /Refusing symbolic link file/,
+  );
+  assert.equal(await readFile(outsideFile, "utf8"), "protected");
 });
 
 test("a failed population preserves every completed universe evidence directory", async (t) => {
@@ -107,7 +295,7 @@ test("a failed population preserves every completed universe evidence directory"
 
   const runUniverse = async (options) => {
     const summary = await runGenesis(options);
-    completed.push(summary.universeId);
+    completed.push(summary);
     if (summary.universeId === "U0002") throw new Error("injected post-run failure");
     return summary;
   };
@@ -120,14 +308,28 @@ test("a failed population preserves every completed universe evidence directory"
       return true;
     },
   );
-  assert.deepEqual(completed.sort(), ["U0001", "U0002", "U0003"]);
-  for (const universeId of completed) {
+  assert.deepEqual(
+    completed.map((summary) => summary.universeId).sort(),
+    ["U0001", "U0002", "U0003"],
+  );
+  for (const completedSummary of completed) {
     const summary = JSON.parse(await readFile(
-      join(runsRoot, config.experimentId, universeId, "summary.json"),
+      join(
+        runsRoot,
+        config.experimentId,
+        completedSummary.universeId,
+        completedSummary.runId,
+        "summary.json",
+      ),
       "utf8",
     ));
-    assert.equal(summary.universeId, universeId);
+    assert.equal(summary.universeId, completedSummary.universeId);
   }
+  const populationId = createPopulationId(config, 3);
+  await assert.rejects(
+    readFile(populationSummaryPath(runsRoot, config.experimentId, populationId), "utf8"),
+    (error) => error.code === "ENOENT",
+  );
   await assert.rejects(
     readFile(populationSummaryPath(runsRoot, config.experimentId), "utf8"),
     (error) => error.code === "ENOENT",

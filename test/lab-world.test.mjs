@@ -7,6 +7,7 @@ import { hashValue } from "../dist/lab/canonical.js";
 import { DEFAULT_GENESIS_CONFIG } from "../dist/lab/config.js";
 import { assertNoOracleLeak } from "../dist/lab/environment.js";
 import { LabEventRecorder } from "../dist/lab/event-recorder.js";
+import { createRunManifest } from "../dist/lab/manifest.js";
 import { RESOURCE_KINDS } from "../dist/lab/resource-physics.js";
 import { LogicalUniverse } from "../dist/lab/world.js";
 
@@ -44,18 +45,7 @@ function testConfig(seed) {
 }
 
 function manifestFor(config) {
-  return {
-    schemaVersion: 1,
-    experimentId: "genesis-1",
-    engineVersion: "genesis-logical-v1.0.0",
-    mode: "logical",
-    policyId: "neutral-backpressure-v1",
-    taskGeneratorId: "deterministic-task-stream-v1",
-    runId: "run:world-test",
-    universeId: "U0001",
-    seed: config.seed,
-    configHash: hashValue(config),
-  };
+  return createRunManifest(config, "U0001");
 }
 
 async function runWorld(directory, seed, callbacks = {}) {
@@ -97,6 +87,27 @@ test("different seeds produce different evidence", async (t) => {
   const second = await runWorld(join(directory, "two"), "seed-two");
   assert.notEqual(await readFile(first.path, "utf8"), await readFile(second.path, "utf8"));
   assert.notEqual(first.recorder.lastHash, second.recorder.lastHash);
+});
+
+test("logical universe refuses nondeterministic run identities and neutral-policy overrides", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "anu-world-identity-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const config = testConfig("identity-seed");
+  const manifest = manifestFor(config);
+  const forged = { ...manifest, runId: "run-arbitrary" };
+  const forgedRecorder = await LabEventRecorder.open(join(directory, "forged.jsonl"), forged);
+  assert.throws(
+    () => new LogicalUniverse(forged, config, forgedRecorder),
+    /runId is not deterministic/,
+  );
+
+  const recorder = await LabEventRecorder.open(join(directory, "override.jsonl"), manifest);
+  assert.throws(
+    () => new LogicalUniverse(manifest, config, recorder, {
+      policy: { id: manifest.policyId, decide: () => [] },
+    }),
+    /neutral policy cannot be overridden/,
+  );
 });
 
 test("observations and task events never expose evaluator oracles", async (t) => {

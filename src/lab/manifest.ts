@@ -1,22 +1,68 @@
 import { hashValue } from "./canonical.js";
 import { validateGenesisConfig } from "./config.js";
 import { deterministicId } from "./ids.js";
-import type { GenesisConfig, RunManifest } from "./types.js";
+import { LAB_SCHEMA_VERSION, type GenesisConfig, type RunManifest } from "./types.js";
 
-export const LAB_ENGINE_VERSION = "genesis-logical-v1.0.0";
+export const LAB_ENGINE_VERSION = "genesis-logical-v1.1.0";
 export const LAB_POLICY_ID = "neutral-backpressure-v1";
 export const LAB_TASK_GENERATOR_ID = "deterministic-task-stream-v1";
 
-export function createRunManifest(config: GenesisConfig, universeId: string): RunManifest {
+export interface RunManifestOptions {
+  policyId?: string;
+}
+
+/** Fail closed when evidence targets semantics other than this exact projector. */
+export function assertLabManifestImplementation(manifest: RunManifest): void {
+  if (typeof manifest.experimentId !== "string" || manifest.experimentId.length === 0) {
+    throw new Error("Lab manifest experimentId must be a non-empty string");
+  }
+  if (typeof manifest.runId !== "string" || manifest.runId.length === 0) {
+    throw new Error("Lab manifest runId must be a non-empty string");
+  }
+  if (typeof manifest.universeId !== "string" || !/^U[0-9]{4,8}$/.test(manifest.universeId)) {
+    throw new Error("Lab manifest universeId is invalid");
+  }
+  if (typeof manifest.seed !== "string" || manifest.seed.trim().length === 0) {
+    throw new Error("Lab manifest seed must be a non-empty string");
+  }
+  if (typeof manifest.configHash !== "string" || !/^[a-f0-9]{64}$/.test(manifest.configHash)) {
+    throw new Error("Lab manifest configHash must be a lowercase SHA-256 digest");
+  }
+  if (manifest.schemaVersion !== LAB_SCHEMA_VERSION) {
+    throw new Error(`Unsupported lab manifest schemaVersion ${String(manifest.schemaVersion)}`);
+  }
+  if (manifest.engineVersion !== LAB_ENGINE_VERSION) {
+    throw new Error(`Unsupported lab engineVersion ${manifest.engineVersion}; expected ${LAB_ENGINE_VERSION}`);
+  }
+  if (manifest.mode !== "logical") throw new Error(`Unsupported lab execution mode ${String(manifest.mode)}`);
+  if (manifest.policyId !== LAB_POLICY_ID) {
+    throw new Error(`Unsupported lab policyId ${manifest.policyId}; expected ${LAB_POLICY_ID}`);
+  }
+  if (manifest.taskGeneratorId !== LAB_TASK_GENERATOR_ID) {
+    throw new Error(
+      `Unsupported lab taskGeneratorId ${manifest.taskGeneratorId}; expected ${LAB_TASK_GENERATOR_ID}`,
+    );
+  }
+}
+
+export function createRunManifest(
+  config: GenesisConfig,
+  universeId: string,
+  options: RunManifestOptions = {},
+): RunManifest {
   validateGenesisConfig(config);
   if (!/^U[0-9]{4,8}$/.test(universeId)) {
     throw new Error("Universe id must match U0001-style notation");
+  }
+  const policyId = options.policyId ?? LAB_POLICY_ID;
+  if (typeof policyId !== "string" || policyId.length === 0 || policyId.length > 128) {
+    throw new Error("Policy id must be a non-empty string of at most 128 characters");
   }
   const configHash = hashValue(config);
   const implementation = {
     engineVersion: LAB_ENGINE_VERSION,
     mode: "logical" as const,
-    policyId: LAB_POLICY_ID,
+    policyId,
     taskGeneratorId: LAB_TASK_GENERATOR_ID,
   };
   return {

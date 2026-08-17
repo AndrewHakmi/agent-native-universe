@@ -1,10 +1,25 @@
-import { link, mkdir, open, readFile, unlink } from "node:fs/promises";
+import { isUtf8 } from "node:buffer";
+import { constants } from "node:fs";
+import { link, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { EvidenceConflictError } from "./artifacts.js";
-import { canonicalJson } from "./canonical.js";
+import { EvidenceConflictError, EvidenceStore } from "./artifacts.js";
+import { canonicalJson, hashValue } from "./canonical.js";
 import { validateGenesisConfig } from "./config.js";
+import {
+  ensureNoSymlinkDirectoryHierarchy,
+  openRegularFileNoFollow,
+  withAnchoredParentDirectory,
+  type AnchoredDirectory,
+} from "./event-stream.js";
 import { runGenesis, type GenesisRunOptions } from "./genesis.js";
-import { populationSeed } from "./manifest.js";
+import {
+  createRunManifest,
+  LAB_ENGINE_VERSION,
+  LAB_POLICY_ID,
+  LAB_TASK_GENERATOR_ID,
+  populationSeed,
+} from "./manifest.js";
+import { ReplayEngine } from "./replay.js";
 import {
   LAB_SCHEMA_VERSION,
   type GenesisConfig,
@@ -14,6 +29,9 @@ import {
 
 export const MAX_POPULATION_PARALLELISM = 64;
 export const MAX_POPULATION_UNIVERSES = 10_000;
+export const LAB_POPULATION_PROTOCOL_ID = "deterministic-population-v1";
+
+const MAX_POPULATION_SUMMARY_BYTES = 64 * 1024 * 1024;
 
 export type GenesisRunExecutor = (options: GenesisRunOptions) => Promise<RunSummary>;
 
@@ -22,7 +40,12 @@ export interface PopulationRunOptions {
   runsRoot: string;
   universes: number;
   parallel?: number;
-  /** Test/integration seam; production callers use the default Genesis runner. */
+  /**
+   * Test/integration seam; production callers use the manifest-bound Genesis
+   * runner. It is not an identity input. Injected output is verified against
+   * its deterministic manifest, config, stored summary, metrics and complete
+   * event replay before it can enter a population catalogue.
+   */
   runUniverse?: GenesisRunExecutor;
 }
 
@@ -59,6 +82,7 @@ export async function runPopulation(options: PopulationRunOptions): Promise<Popu
   const workerCount = Math.min(requestedParallel, options.universes);
   const baseConfig = structuredClone(options.config);
   const baseSeed = baseConfig.seed;
+  const populationIdValue = createPopulationId(baseConfig, options.universes);
   const universeIds = Array.from(
     { length: options.universes },
     (_, index) => universeId(index + 1),
@@ -76,13 +100,22 @@ export async function runPopulation(options: PopulationRunOptions): Promise<Popu
       const id = universeIds[index]!;
       const config = structuredClone(baseConfig);
       config.seed = populationSeed(baseSeed, id);
+      const expectedManifest = createRunManifest(config, id);
       try {
         const summary = await execute({
-          config,
+          config: structuredClone(config),
           runsRoot: options.runsRoot,
           universeId: id,
         });
-        assertSummaryIdentity(summary, id, config.seed);
+        assertSummaryIdentity(summary, expectedManifest.runId, id, config);
+        if (options.runUniverse !== undefined) {
+          await assertInjectedSummaryEvidence(
+            summary,
+            expectedManifest,
+            config,
+            options.runsRoot,
+          );
+        }
         summaries[index] = structuredClone(summary);
       } catch (cause) {
         // Evidence is append-only and intentionally left in place for diagnosis.
@@ -105,7 +138,7 @@ export async function runPopulation(options: PopulationRunOptions): Promise<Popu
     baseSeed,
     universes: complete,
   };
-  await writePopulationSummary(options.runsRoot, population);
+  await writePopulationSummary(options.runsRoot, populationIdValue, population);
   return structuredClone(population);
 }
 
@@ -114,20 +147,65 @@ export function universeId(ordinal: number): string {
   return `U${String(ordinal).padStart(4, "0")}`;
 }
 
-export function populationSummaryPath(runsRoot: string, experimentId: string): string {
+/**
+ * Address one production population by every declared scientific input that
+ * may change its result.
+ *
+ * Worker parallelism and the storage root are deliberately absent: they are
+ * operational choices and must not fork otherwise identical evidence.
+ */
+export function createPopulationId(config: GenesisConfig, universes: number): string {
+  validateGenesisConfig(config);
+  assertPositiveBoundedInteger(universes, MAX_POPULATION_UNIVERSES, "universes");
+  const digest = hashValue({
+    domain: "agent-native-universe/lab/population-identity/v1",
+    populationProtocolId: LAB_POPULATION_PROTOCOL_ID,
+    implementation: {
+      engineVersion: LAB_ENGINE_VERSION,
+      policyId: LAB_POLICY_ID,
+      taskGeneratorId: LAB_TASK_GENERATOR_ID,
+    },
+    config,
+    universes,
+  });
+  return `population-${digest}`;
+}
+
+/**
+ * Return an immutable population summary path.
+ *
+ * Omitting `populationId` intentionally preserves the original v1 path for
+ * callers that need to read legacy `<experiment>/population.json` evidence.
+ * New writers always pass a deterministic population identity.
+ */
+export function populationSummaryPath(
+  runsRoot: string,
+  experimentId: string,
+  populationId?: string,
+): string {
   if (!runsRoot) throw new TypeError("Population runs root must not be empty");
-  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(experimentId)) {
-    throw new Error("Unsafe population experiment id");
-  }
-  return join(resolve(runsRoot), experimentId, "population.json");
+  assertSafeIdentifier(experimentId, "population experiment id");
+  const experimentDirectory = join(resolve(runsRoot), experimentId);
+  if (populationId === undefined) return join(experimentDirectory, "population.json");
+  assertSafeIdentifier(populationId, "population id");
+  return join(experimentDirectory, "populations", populationId, "population.json");
 }
 
 let temporarySequence = 0;
 
-async function writePopulationSummary(runsRoot: string, summary: PopulationSummary): Promise<void> {
-  const path = populationSummaryPath(runsRoot, summary.experimentId);
+async function writePopulationSummary(
+  runsRoot: string,
+  populationId: string,
+  summary: PopulationSummary,
+): Promise<void> {
+  const path = populationSummaryPath(runsRoot, summary.experimentId, populationId);
   const serialized = canonicalJson(summary);
-  await mkdir(dirname(path), { recursive: true });
+  if (Buffer.byteLength(serialized, "utf8") > MAX_POPULATION_SUMMARY_BYTES) {
+    throw new Error(
+      `Population summary exceeds the ${MAX_POPULATION_SUMMARY_BYTES}-byte safety limit`,
+    );
+  }
+  await ensureNoSymlinkDirectoryHierarchy(dirname(path));
 
   const existing = await readIfPresent(path);
   if (existing !== undefined) {
@@ -135,44 +213,151 @@ async function writePopulationSummary(runsRoot: string, summary: PopulationSumma
     throw new EvidenceConflictError("Refusing to replace existing population summary");
   }
 
-  const temporary = `${path}.tmp-${process.pid}-${temporarySequence += 1}`;
-  let handle: Awaited<ReturnType<typeof open>> | undefined;
-  try {
-    handle = await open(temporary, "wx", 0o600);
-    await handle.writeFile(serialized, "utf8");
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
+  await withAnchoredParentDirectory(path, {}, async (directory, name) => {
+    const temporaryName = `${name}.tmp-${process.pid}-${temporarySequence += 1}`;
+    let handle: Awaited<ReturnType<typeof openRegularFileNoFollow>> | undefined;
     try {
-      // Hard-link publication is atomic and cannot overwrite concurrent evidence.
-      await link(temporary, path);
-    } catch (error) {
-      if (!isAlreadyExists(error)) throw error;
-      const concurrent = await readFile(path, "utf8");
-      if (concurrent !== serialized) {
-        throw new EvidenceConflictError("Concurrent population summary conflicts with this run");
+      handle = await directory.openRegular(
+        temporaryName,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL,
+      );
+      await handle.writeFile(serialized, "utf8");
+      await handle.sync();
+      await handle.close();
+      handle = undefined;
+      try {
+        // Hard-link publication stays relative to one held parent descriptor.
+        await link(directory.entry(temporaryName), directory.entry(name));
+      } catch (error) {
+        if (!isAlreadyExists(error)) throw error;
+        const concurrent = await readFromAnchoredDirectory(directory, name);
+        if (concurrent !== serialized) {
+          throw new EvidenceConflictError("Concurrent population summary conflicts with this run");
+        }
       }
+    } finally {
+      await handle?.close().catch(() => undefined);
+      await unlink(directory.entry(temporaryName)).catch((error: unknown) => {
+        if (!isMissing(error)) throw error;
+      });
     }
-  } finally {
-    await handle?.close().catch(() => undefined);
-    await unlink(temporary).catch(() => undefined);
-  }
+  });
 }
 
 async function readIfPresent(path: string): Promise<string | undefined> {
+  let handle: Awaited<ReturnType<typeof openRegularFileNoFollow>>;
   try {
-    return await readFile(path, "utf8");
+    handle = await openRegularFileNoFollow(path, constants.O_RDONLY);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw error;
   }
+  return readPopulationHandle(handle, path);
 }
 
-function assertSummaryIdentity(summary: RunSummary, universeIdValue: string, seed: string): void {
+async function readFromAnchoredDirectory(
+  directory: AnchoredDirectory,
+  name: string,
+): Promise<string> {
+  const handle = await directory.openRegular(name, constants.O_RDONLY);
+  return readPopulationHandle(handle, `${directory.displayPath}/${name}`);
+}
+
+async function readPopulationHandle(
+  handle: Awaited<ReturnType<typeof openRegularFileNoFollow>>,
+  path: string,
+): Promise<string> {
+  try {
+    const info = await handle.stat();
+    if (info.size > MAX_POPULATION_SUMMARY_BYTES) {
+      throw new Error(
+        `Population summary exceeds the ${MAX_POPULATION_SUMMARY_BYTES}-byte safety limit`,
+      );
+    }
+    const bytes = await handle.readFile();
+    if (bytes.length > MAX_POPULATION_SUMMARY_BYTES) {
+      throw new Error(
+        `Population summary exceeds the ${MAX_POPULATION_SUMMARY_BYTES}-byte safety limit`,
+      );
+    }
+    if (!isUtf8(bytes)) throw new Error(`Population summary is not valid UTF-8: ${path}`);
+    return bytes.toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+function assertSummaryIdentity(
+  summary: RunSummary,
+  expectedRunId: string,
+  universeIdValue: string,
+  config: GenesisConfig,
+): void {
+  if (summary.schemaVersion !== LAB_SCHEMA_VERSION) {
+    throw new Error(`Runner returned the wrong schema for ${universeIdValue}`);
+  }
+  if (summary.runId !== expectedRunId) {
+    throw new Error(`Runner returned the wrong run id for ${universeIdValue}`);
+  }
   if (summary.universeId !== universeIdValue) {
     throw new Error(`Runner returned ${summary.universeId} for ${universeIdValue}`);
   }
-  if (summary.seed !== seed) throw new Error(`Runner returned the wrong seed for ${universeIdValue}`);
+  if (summary.seed !== config.seed) {
+    throw new Error(`Runner returned the wrong seed for ${universeIdValue}`);
+  }
+  if (summary.ticks !== config.ticks) {
+    throw new Error(`Runner returned the wrong tick count for ${universeIdValue}`);
+  }
+}
+
+async function assertInjectedSummaryEvidence(
+  returned: RunSummary,
+  expectedManifest: ReturnType<typeof createRunManifest>,
+  expectedConfig: GenesisConfig,
+  runsRoot: string,
+): Promise<void> {
+  const evidence = await EvidenceStore.openExisting(
+    runsRoot,
+    expectedManifest.experimentId,
+    expectedManifest.universeId,
+    expectedManifest.runId,
+  );
+  const manifest = await evidence.readManifest();
+  if (hashValue(manifest) !== hashValue(expectedManifest)) {
+    throw new Error(`Injected runner evidence manifest mismatch for ${expectedManifest.universeId}`);
+  }
+  const config = await evidence.readConfig();
+  if (hashValue(config) !== hashValue(expectedConfig)) {
+    throw new Error(`Injected runner evidence config mismatch for ${expectedManifest.universeId}`);
+  }
+
+  const replay = await ReplayEngine.replayFile(evidence.eventsPath, manifest, config);
+  if (!replay.state.completed || replay.lastTick !== config.ticks) {
+    throw new Error(`Injected runner evidence is incomplete for ${expectedManifest.universeId}`);
+  }
+  const metrics = await evidence.readMetrics();
+  const latestMetrics = metrics.at(-1);
+  if (latestMetrics === undefined || hashValue(metrics) !== hashValue(replay.state.metrics)) {
+    throw new Error(`Injected runner metrics do not match evidence for ${expectedManifest.universeId}`);
+  }
+  const verified: RunSummary = {
+    schemaVersion: LAB_SCHEMA_VERSION,
+    runId: manifest.runId,
+    universeId: manifest.universeId,
+    seed: manifest.seed,
+    ticks: config.ticks,
+    events: replay.eventsApplied,
+    finalStateHash: replay.stateHash,
+    finalEventHash: replay.finalEventHash,
+    latestMetrics: structuredClone(latestMetrics),
+  };
+  const stored = await evidence.readSummary();
+  if (stored === undefined || hashValue(stored) !== hashValue(verified)) {
+    throw new Error(`Stored summary does not match verified evidence for ${manifest.universeId}`);
+  }
+  if (hashValue(returned) !== hashValue(verified)) {
+    throw new Error(`Injected runner summary does not match verified evidence for ${manifest.universeId}`);
+  }
 }
 
 function assertPositiveBoundedInteger(value: number, maximum: number, label: string): void {
@@ -187,4 +372,18 @@ function compareIds(left: string, right: string): number {
 
 function isAlreadyExists(error: unknown): boolean {
   return (error as NodeJS.ErrnoException).code === "EEXIST";
+}
+
+function isMissing(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException).code === "ENOENT";
+}
+
+function assertSafeIdentifier(value: string, label: string): void {
+  if (
+    typeof value !== "string"
+    || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)
+    || value.includes("..")
+  ) {
+    throw new TypeError(`${label} is unsafe`);
+  }
 }

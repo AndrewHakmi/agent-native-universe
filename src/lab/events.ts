@@ -12,8 +12,9 @@ import {
 
 const EVENT_TYPES = new Set<LabEventType>([
   "run.started", "agent.created", "agent.retired", "task.created", "task.claimed", "task.submitted",
-  "task.evaluated", "task.expired", "link.created", "link.removed", "link.used", "resource.spent",
-  "resource.transferred", "memory.stored", "memory.retrieved", "message.sent", "capability.published",
+  "task.evaluated", "task.expired", "submission.verified", "link.created", "link.removed", "link.used",
+  "resource.spent", "resource.transferred", "memory.stored", "memory.retrieved", "message.sent",
+  "message.delivered", "capability.published",
   "capability.used", "agent.learning.updated", "pressure.applied", "violation.recorded", "metrics.recorded",
   "tick.completed", "run.completed",
 ]);
@@ -30,6 +31,9 @@ const EVENT_KEYS = new Set([
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 
+/** Maximum canonical JSON bytes for one event, shared by every writer and reader. */
+export const MAX_LAB_EVENT_BYTES = 262_144;
+
 export class EventChainError extends Error {
   constructor(message: string) {
     super(message);
@@ -42,6 +46,15 @@ export interface EventChainVerification {
   lastSeq: number;
   lastTick: number;
   lastHash: string;
+}
+
+export function initialEventChainVerification(manifest: RunManifest): EventChainVerification {
+  return {
+    events: 0,
+    lastSeq: 0,
+    lastTick: 0,
+    lastHash: initialEventHash(manifest),
+  };
 }
 
 export function initialEventHash(manifest: RunManifest): string {
@@ -85,7 +98,11 @@ export function serializeLabEvent(event: LabEvent): string {
   validateLabEvent(event);
   const expected = computeEventHash(event);
   if (event.hash !== expected) throw new EventChainError(`Event ${event.seq} hash mismatch`);
-  return canonicalJson(event);
+  const serialized = canonicalJson(event);
+  if (Buffer.byteLength(serialized, "utf8") > MAX_LAB_EVENT_BYTES) {
+    throw new EventChainError(`Event ${event.seq} exceeds the ${MAX_LAB_EVENT_BYTES}-byte limit`);
+  }
+  return serialized;
 }
 
 export function deserializeEventJsonl(text: string): LabEvent[] {
@@ -94,6 +111,9 @@ export function deserializeEventJsonl(text: string): LabEvent[] {
   const lines = text.slice(0, -1).split("\n");
   return lines.map((line, index) => {
     if (line.length === 0) throw new EventChainError(`Event log contains a blank line at ${index + 1}`);
+    if (Buffer.byteLength(line, "utf8") > MAX_LAB_EVENT_BYTES) {
+      throw new EventChainError(`Event log line ${index + 1} exceeds the ${MAX_LAB_EVENT_BYTES}-byte limit`);
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(line);
@@ -101,39 +121,57 @@ export function deserializeEventJsonl(text: string): LabEvent[] {
       throw new EventChainError(`Invalid JSON at event log line ${index + 1}: ${errorMessage(error)}`);
     }
     validateLabEvent(parsed);
+    if (canonicalJson(parsed) !== line) {
+      throw new EventChainError(`Event log line ${index + 1} is not canonical JSON`);
+    }
     return parsed;
   });
 }
 
 export function verifyEventChain(events: readonly LabEvent[], manifest: RunManifest): EventChainVerification {
-  let expectedPreviousHash = initialEventHash(manifest);
-  let previousTick = 0;
-
+  let verification = initialEventChainVerification(manifest);
   for (let index = 0; index < events.length; index += 1) {
     const event = events[index];
     if (!event) throw new EventChainError(`Missing event at index ${index}`);
-    validateLabEvent(event);
-    const expectedSeq = index + 1;
-    if (event.seq !== expectedSeq) throw new EventChainError(`Expected event sequence ${expectedSeq}, got ${event.seq}`);
-    if (event.runId !== manifest.runId || event.universeId !== manifest.universeId) {
-      throw new EventChainError(`Event ${event.seq} belongs to another run or universe`);
-    }
-    if (event.schemaVersion !== manifest.schemaVersion) throw new EventChainError(`Event ${event.seq} schema mismatch`);
-    const expectedId = deterministicId("event", manifest.runId, manifest.universeId, event.seq);
-    if (event.eventId !== expectedId) throw new EventChainError(`Event ${event.seq} has a non-deterministic eventId`);
-    if (event.previousHash !== expectedPreviousHash) throw new EventChainError(`Event ${event.seq} previousHash mismatch`);
-    if (event.tick < previousTick) throw new EventChainError(`Event ${event.seq} moves logical time backwards`);
-    const expectedHash = computeEventHash(event);
-    if (event.hash !== expectedHash) throw new EventChainError(`Event ${event.seq} hash mismatch`);
-    expectedPreviousHash = event.hash;
-    previousTick = event.tick;
+    verification = verifyNextEvent(event, manifest, verification);
   }
+  return verification;
+}
 
+/** Verify one event against an already verified prefix without retaining that prefix. */
+export function verifyNextEvent(
+  event: LabEvent,
+  manifest: RunManifest,
+  previous: EventChainVerification,
+): EventChainVerification {
+  validateLabEvent(event);
+  const expectedSeq = previous.lastSeq + 1;
+  if (event.seq !== expectedSeq) {
+    throw new EventChainError(`Expected event sequence ${expectedSeq}, got ${event.seq}`);
+  }
+  if (event.runId !== manifest.runId || event.universeId !== manifest.universeId) {
+    throw new EventChainError(`Event ${event.seq} belongs to another run or universe`);
+  }
+  if (event.schemaVersion !== manifest.schemaVersion) {
+    throw new EventChainError(`Event ${event.seq} schema mismatch`);
+  }
+  const expectedId = deterministicId("event", manifest.runId, manifest.universeId, event.seq);
+  if (event.eventId !== expectedId) {
+    throw new EventChainError(`Event ${event.seq} has a non-deterministic eventId`);
+  }
+  if (event.previousHash !== previous.lastHash) {
+    throw new EventChainError(`Event ${event.seq} previousHash mismatch`);
+  }
+  if (event.tick < previous.lastTick) {
+    throw new EventChainError(`Event ${event.seq} moves logical time backwards`);
+  }
+  const expectedHash = computeEventHash(event);
+  if (event.hash !== expectedHash) throw new EventChainError(`Event ${event.seq} hash mismatch`);
   return {
-    events: events.length,
-    lastSeq: events.length,
-    lastTick: events.at(-1)?.tick ?? 0,
-    lastHash: expectedPreviousHash,
+    events: previous.events + 1,
+    lastSeq: event.seq,
+    lastTick: event.tick,
+    lastHash: event.hash,
   };
 }
 
@@ -150,7 +188,7 @@ function assertDraft(draft: LabEventDraft): void {
   canonicalJson(draft.data);
 }
 
-function validateLabEvent(value: unknown): asserts value is LabEvent {
+export function validateLabEvent(value: unknown): asserts value is LabEvent {
   assertJsonObject(value, "event");
   for (const key of Object.keys(value)) {
     if (!EVENT_KEYS.has(key)) throw new EventChainError(`Event contains unknown field ${key}`);
@@ -170,7 +208,10 @@ function validateLabEvent(value: unknown): asserts value is LabEvent {
     const field = value[key];
     if (field !== undefined) assertNonEmptyString(field, key);
   }
-  canonicalJson(value);
+  const serialized = canonicalJson(value);
+  if (Buffer.byteLength(serialized, "utf8") > MAX_LAB_EVENT_BYTES) {
+    throw new EventChainError(`Event ${String(value.seq)} exceeds the ${MAX_LAB_EVENT_BYTES}-byte limit`);
+  }
 }
 
 function cloneJsonObject(value: JsonObject): JsonObject {

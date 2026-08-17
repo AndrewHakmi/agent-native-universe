@@ -1,9 +1,8 @@
 import type { JsonObject, JsonValue } from "../core/types.js";
 import { assertRoleNeutralGenesis, createGenesisAgents } from "./agent-factory.js";
-import { createCapabilityState } from "./capability-registry.js";
+import { createCapabilityState, executeCapabilityPlan } from "./capability-registry.js";
 import { hashValue } from "./canonical.js";
 import { validateGenesisConfig } from "./config.js";
-import { observeWorld } from "./environment.js";
 import { IndependentEvaluator } from "./evaluator.js";
 import type { LabEventRecorder } from "./event-recorder.js";
 import { createLabEvent } from "./events.js";
@@ -12,20 +11,26 @@ import {
   LAB_ENGINE_VERSION,
   LAB_POLICY_ID,
   LAB_TASK_GENERATOR_ID,
+  createRunManifest,
 } from "./manifest.js";
 import { computeMetrics } from "./metrics.js";
-import { NeutralPolicy, type NeutralPolicyRandomSource } from "./neutral-policy.js";
+import { NeutralPolicy } from "./neutral-policy.js";
+import {
+  decidePolicyTick,
+  type LogicalPolicy,
+  type PolicyDecision,
+} from "./policy-schedule.js";
 import { PressureEngine } from "./pressure-engine.js";
-import { initialWorldState, reduceWorldEvent } from "./reducer.js";
+import { initialWorldState, prepareWorldEventTransition } from "./reducer.js";
 import { RESOURCE_KINDS, ResourcePhysics } from "./resource-physics.js";
 import { DeterministicRng } from "./rng.js";
 import { DeterministicTaskStream } from "./task-stream.js";
 import {
   LAB_SCHEMA_VERSION,
   PPM,
+  ZERO_RESOURCES,
   type Checkpoint,
   type GenesisConfig,
-  type LabAgentState,
   type LabEvent,
   type LabEventDraft,
   type MetricsSnapshot,
@@ -34,24 +39,15 @@ import {
   type ResourceVector,
   type RunManifest,
   type SubmissionState,
-  type WorldAction,
   type WorldState,
 } from "./types.js";
 
-export interface LogicalPolicy {
-  decide(observation: Observation, agent: LabAgentState, rng: NeutralPolicyRandomSource): WorldAction[];
-}
+export type { LogicalPolicy } from "./policy-schedule.js";
 
 export interface LogicalUniverseOptions {
   policy?: LogicalPolicy;
   onMetrics?: (snapshot: MetricsSnapshot) => void | Promise<void>;
   onCheckpoint?: (checkpoint: Checkpoint) => void | Promise<void>;
-}
-
-interface Decision {
-  actorId: string;
-  localIndex: number;
-  action: WorldAction;
 }
 
 const UNSUPPORTED_ACTIONS = new Set<PrimitiveActionType>([
@@ -94,7 +90,6 @@ export class LogicalUniverse {
     if (
       manifest.engineVersion !== LAB_ENGINE_VERSION
       || manifest.mode !== "logical"
-      || manifest.policyId !== LAB_POLICY_ID
       || manifest.taskGeneratorId !== LAB_TASK_GENERATOR_ID
     ) {
       throw new Error("Manifest implementation identity does not match this logical engine");
@@ -104,6 +99,19 @@ export class LogicalUniverse {
     if (manifest.configHash !== hashValue(config)) throw new Error("Manifest configHash does not match config");
     if (recorder.manifest.runId !== manifest.runId || recorder.manifest.universeId !== manifest.universeId) {
       throw new Error("Recorder belongs to another run or universe");
+    }
+
+    const expectedManifest = createRunManifest(config, manifest.universeId, { policyId: manifest.policyId });
+    if (hashValue(manifest) !== hashValue(expectedManifest)) {
+      throw new Error("Manifest identity or runId is not deterministic for this config and policy");
+    }
+    if (manifest.policyId === LAB_POLICY_ID && options.policy !== undefined) {
+      throw new Error("The manifest-bound neutral policy cannot be overridden");
+    }
+    if (manifest.policyId !== LAB_POLICY_ID) {
+      if (options.policy === undefined || options.policy.id !== manifest.policyId) {
+        throw new Error("Custom policy identity must exactly match manifest.policyId");
+      }
     }
 
     this.manifest = structuredClone(manifest);
@@ -145,7 +153,33 @@ export class LogicalUniverse {
   }
 
   async initialize(): Promise<WorldState> {
-    if (this.#initialized) return this.state();
+    await this.#ensureInitialized();
+    return this.state();
+  }
+
+  async run(): Promise<WorldState> {
+    await this.#ensureInitialized();
+    while (this.#nextTick <= this.config.ticks) await this.#advanceTick();
+    if (!this.#world.completed) {
+      await this.#commit({
+        tick: this.config.ticks,
+        phase: "completion",
+        type: "run.completed",
+        data: { ticks: this.config.ticks, events: this.recorder.lastSeq + 1 },
+      });
+      await this.#onCheckpoint?.(this.#checkpoint(this.config.ticks));
+    }
+    return this.state();
+  }
+
+  async tick(): Promise<WorldState> {
+    await this.#ensureInitialized();
+    await this.#advanceTick();
+    return this.state();
+  }
+
+  async #ensureInitialized(): Promise<void> {
+    if (this.#initialized) return;
     if (this.recorder.lastSeq !== 0) throw new Error("LogicalUniverse v1 requires an empty event recorder");
 
     await this.#commit({
@@ -167,26 +201,9 @@ export class LogicalUniverse {
     }
     this.#initialTotal = totalResources(this.#world);
     this.#initialized = true;
-    return this.state();
   }
 
-  async run(): Promise<WorldState> {
-    await this.initialize();
-    while (this.#nextTick <= this.config.ticks) await this.tick();
-    if (!this.#world.completed) {
-      await this.#commit({
-        tick: this.config.ticks,
-        phase: "completion",
-        type: "run.completed",
-        data: { ticks: this.config.ticks, events: this.recorder.lastSeq + 1 },
-      });
-      await this.#onCheckpoint?.(this.#checkpoint(this.config.ticks));
-    }
-    return this.state();
-  }
-
-  async tick(): Promise<WorldState> {
-    await this.initialize();
+  async #advanceTick(): Promise<void> {
     if (this.#world.completed) throw new Error("Run is already completed");
     if (this.#nextTick > this.config.ticks) throw new Error("Configured tick limit reached");
     if (this.#tickRunning) throw new Error("A logical tick is already running");
@@ -225,7 +242,6 @@ export class LogicalUniverse {
 
       const checkpoint = tick % this.config.checkpointEvery === 0 && tick !== this.config.ticks;
       if (checkpoint && this.#onCheckpoint) await this.#onCheckpoint(this.#checkpoint(tick));
-      return this.state();
     } finally {
       this.#tickRunning = false;
     }
@@ -233,13 +249,19 @@ export class LogicalUniverse {
 
   async #applyPressures(tick: number): Promise<void> {
     const result = this.#pressure.forTick(tick, this.#world, this.#pressureRng.fork(tick));
-    for (const event of result.events) await this.#commit(event);
+    let retirementPressure: LabEvent | undefined;
+    for (const event of result.events) {
+      const committed = await this.#commit(event);
+      if (committed.data.type === "retire_agent_fraction") retirementPressure = committed;
+    }
     for (const agentId of result.retiredAgentIds) {
+      if (!retirementPressure) throw new Error("Retirement pressure has no committed causal event");
       await this.#commit({
         tick,
         phase: "pressure",
         type: "agent.retired",
         actorId: agentId,
+        causationId: retirementPressure.eventId,
         data: { agentId, retiredTick: tick, reason: "pressure" },
       });
     }
@@ -247,7 +269,10 @@ export class LogicalUniverse {
 
   async #expireTasks(tick: number): Promise<void> {
     const expired = Object.values(this.#world.tasks)
-      .filter((task) => task.status !== "completed" && task.status !== "expired" && task.deadlineTick < tick)
+      .filter((task) => (
+        (task.status === "available" || task.status === "claimed")
+        && task.deadlineTick < tick
+      ))
       .sort((left, right) => left.id < right.id ? -1 : left.id > right.id ? 1 : 0);
     for (const task of expired) {
       await this.#commit({
@@ -276,40 +301,31 @@ export class LogicalUniverse {
     }
   }
 
-  async #decide(tick: number): Promise<Decision[]> {
-    const immutableState = structuredClone(this.#world);
-    const agentIds = Object.values(immutableState.agents)
-      .filter((agent) => agent.active)
-      .map((agent) => agent.id)
-      .sort((left, right) => left < right ? -1 : left > right ? 1 : 0);
-    const observations: Observation[] = [];
-    const decisions: Decision[] = [];
-    for (const agentId of agentIds) {
-      const observation = observeWorld(immutableState, agentId);
-      observations.push(structuredClone(observation));
-      try {
-        const actions = this.#policy.decide(
-          deepFreeze(structuredClone(observation)),
-          deepFreeze(structuredClone(immutableState.agents[agentId]!)),
-          this.#policyRng,
-        );
-        for (const [localIndex, action] of actions.entries()) {
-          decisions.push({ actorId: agentId, localIndex, action: structuredClone(action) });
-        }
-      } catch (error) {
-        await this.#violation(agentId, "reason", `policy error: ${errorMessage(error)}`, tick);
-      }
+  async #decide(tick: number): Promise<PolicyDecision[]> {
+    // The world cannot change during this phase: policies only receive cloned,
+    // frozen agent/observation values, and policy failures are committed after
+    // every agent has observed the same snapshot.
+    const batch = decidePolicyTick(this.#world, tick, this.#policy, this.#policyRng);
+    this.#observations = batch.observations;
+    for (const violation of batch.violations) {
+      await this.#violation(violation.actorId, "reason", violation.reason, tick);
     }
-    this.#observations = observations;
-    return decisions;
+    return batch.decisions;
   }
 
-  async #resolve(decision: Decision, tick: number, pendingEvaluation: string[]): Promise<void> {
+  async #resolve(decision: PolicyDecision, tick: number, pendingEvaluation: string[]): Promise<void> {
     const { actorId, action } = decision;
     if (!this.#world.agents[actorId]?.active) return;
-    if (!await this.#pay(actorId, action.type, tick)) return;
+    const payment = await this.#pay(actorId, action.type, tick);
+    if (!payment) return;
     if (UNSUPPORTED_ACTIONS.has(action.type)) {
-      await this.#violation(actorId, action.type, `${action.type} is unsupported in logical v1`, tick);
+      await this.#violation(
+        actorId,
+        action.type,
+        `${action.type} is unsupported in logical v1`,
+        tick,
+        payment.eventId,
+      );
       return;
     }
 
@@ -326,6 +342,7 @@ export class LogicalUniverse {
           if (!task || task.status !== "available") return;
           await this.#commit({
             tick, phase: "resolution", type: "task.claimed", actorId,
+            causationId: payment.eventId,
             data: { taskId: action.taskId, agentId: actorId },
           });
           return;
@@ -340,11 +357,13 @@ export class LogicalUniverse {
             phase: "resolution",
             type: "memory.stored",
             actorId,
+            causationId: payment.eventId,
             data: toJsonObject({
               agentId: actorId,
               key: NeutralPolicy.resultMemoryKey(action.taskId),
               value: action.result,
               action: "execute",
+              taskId: action.taskId,
             }),
           });
           return;
@@ -360,19 +379,55 @@ export class LogicalUniverse {
             agentId: actorId,
             result: structuredClone(action.result),
             submittedTick: tick,
+            submittedSeq: this.recorder.lastSeq + 1,
+            submittedEventId: deterministicId(
+              "event",
+              this.manifest.runId,
+              this.manifest.universeId,
+              this.recorder.lastSeq + 1,
+            ),
             accepted: false,
             qualityPpm: 0,
             latencyTicks: 0,
           };
           await this.#commit({
             tick, phase: "resolution", type: "task.submitted", actorId,
+            causationId: payment.eventId,
             data: toJsonObject({ submission }),
           });
           pendingEvaluation.push(submission.id);
           return;
         }
         case "verify": {
-          if (!this.#world.submissions[action.submissionId]) throw new Error(`Unknown submission ${action.submissionId}`);
+          const submission = this.#world.submissions[action.submissionId];
+          if (!submission) throw new Error(`Unknown submission ${action.submissionId}`);
+          if (submission.agentId === actorId) throw new Error("Agents cannot verify their own submissions");
+          const duplicate = Object.values(this.#world.verifications).some((verification) => (
+            verification.submissionId === submission.id && verification.verifierId === actorId
+          ));
+          if (duplicate) throw new Error(`Submission ${submission.id} is already verified by ${actorId}`);
+          const matchesSubmission = hashValue(action.computedResult) === hashValue(submission.result);
+          if (action.verdict !== matchesSubmission) {
+            throw new Error("Verification verdict does not match the independently computed result");
+          }
+          const verification = {
+            id: deterministicId("verification", this.manifest.runId, submission.id, actorId),
+            submissionId: submission.id,
+            verifierId: actorId,
+            computedResult: structuredClone(action.computedResult),
+            verdict: action.verdict,
+            matchesSubmission,
+            createdTick: tick,
+          };
+          await this.#commit({
+            tick,
+            phase: "resolution",
+            type: "submission.verified",
+            actorId,
+            targetId: submission.agentId,
+            causationId: payment.eventId,
+            data: toJsonObject({ verification }),
+          });
           return;
         }
         case "connect": {
@@ -389,6 +444,7 @@ export class LogicalUniverse {
           };
           await this.#commit({
             tick, phase: "resolution", type: "link.created", actorId, targetId: action.targetId,
+            causationId: payment.eventId,
             data: toJsonObject({ link }),
           });
           return;
@@ -398,6 +454,7 @@ export class LogicalUniverse {
           if (!link) throw new Error("Agents are not connected");
           await this.#commit({
             tick, phase: "resolution", type: "link.removed", actorId, targetId: action.targetId,
+            causationId: payment.eventId,
             data: { linkId: link.id },
           });
           return;
@@ -406,20 +463,53 @@ export class LogicalUniverse {
           this.#requireActiveTarget(actorId, action.targetId);
           const link = this.#findLink(actorId, action.targetId);
           if (!link) throw new Error("Messages require an active link");
-          await this.#commit({
+          const message = {
+            id: deterministicId(
+              "message", this.manifest.runId, this.manifest.universeId,
+              tick, actorId, action.targetId, decision.localIndex,
+            ),
+            senderId: actorId,
+            recipientId: action.targetId,
+            payload: structuredClone(action.payload),
+            sentTick: tick,
+            sentSeq: this.recorder.lastSeq + 1,
+            sentEventId: deterministicId(
+              "event",
+              this.manifest.runId,
+              this.manifest.universeId,
+              this.recorder.lastSeq + 1,
+            ),
+            linkId: link.id,
+            localIndex: decision.localIndex,
+          };
+          const sent = await this.#commit({
             tick, phase: "resolution", type: "message.sent", actorId, targetId: action.targetId,
-            data: toJsonObject({ agentId: actorId, targetId: action.targetId, payload: action.payload }),
+            causationId: payment.eventId,
+            data: toJsonObject({ message }),
           });
           await this.#commit({
+            tick,
+            phase: "resolution",
+            type: "message.delivered",
+            actorId,
+            targetId: action.targetId,
+            causationId: sent.eventId,
+            data: { messageId: message.id, linkId: link.id },
+          });
+          const delivered = this.#world.messages[message.id]?.deliveredEventId;
+          if (!delivered) throw new Error(`Message ${message.id} was not synchronously delivered`);
+          await this.#commit({
             tick, phase: "resolution", type: "link.used", actorId, targetId: action.targetId,
-            data: { linkId: link.id },
+            causationId: delivered,
+            data: { linkId: link.id, messageId: message.id },
           });
           return;
         }
         case "store":
           await this.#commit({
             tick, phase: "resolution", type: "memory.stored", actorId,
-            data: toJsonObject({ agentId: actorId, key: action.key, value: action.value }),
+            causationId: payment.eventId,
+            data: toJsonObject({ agentId: actorId, key: action.key, value: action.value, action: "store" }),
           });
           return;
         case "retrieve": {
@@ -427,7 +517,8 @@ export class LogicalUniverse {
           if (!Object.hasOwn(memory, action.key)) throw new Error(`Unknown memory key ${action.key}`);
           await this.#commit({
             tick, phase: "resolution", type: "memory.retrieved", actorId,
-            data: toJsonObject({ agentId: actorId, key: action.key, value: memory[action.key] }),
+            causationId: payment.eventId,
+            data: toJsonObject({ agentId: actorId, key: action.key, value: memory[action.key], action: "retrieve" }),
           });
           return;
         }
@@ -436,15 +527,94 @@ export class LogicalUniverse {
           const capability = createCapabilityState(actorId, tick, action.capability);
           await this.#commit({
             tick, phase: "resolution", type: "capability.published", actorId,
+            causationId: payment.eventId,
             data: toJsonObject({ capability }),
           });
           return;
         }
         case "useCapability": {
-          if (!this.#world.capabilities[action.capabilityId]) throw new Error(`Unknown capability ${action.capabilityId}`);
+          const capability = this.#world.capabilities[action.capabilityId];
+          if (!capability) throw new Error(`Unknown capability ${action.capabilityId}`);
+          const invocationId = deterministicId(
+            "capability-invocation", this.manifest.runId, this.manifest.universeId,
+            tick, actorId, capability.id, decision.localIndex,
+          );
+          let output: JsonObject;
+          try {
+            output = executeCapabilityPlan(capability, action.input);
+          } catch {
+            await this.#commit({
+              tick,
+              phase: "resolution",
+              type: "capability.used",
+              actorId,
+              targetId: capability.ownerId,
+              causationId: payment.eventId,
+              data: toJsonObject({
+                invocation: {
+                  id: invocationId,
+                  capabilityId: capability.id,
+                  callerId: actorId,
+                  input: action.input,
+                  accepted: false,
+                  success: false,
+                  chargedCost: ZERO_RESOURCES,
+                  createdTick: tick,
+                  localIndex: decision.localIndex,
+                  reason: "execution_failed",
+                },
+              }),
+            });
+            return;
+          }
+          if (!this.#physics.canAfford(this.#world.agents[actorId]!.resources, capability.cost)) {
+            await this.#commit({
+              tick,
+              phase: "resolution",
+              type: "capability.used",
+              actorId,
+              targetId: capability.ownerId,
+              causationId: payment.eventId,
+              data: toJsonObject({
+                invocation: {
+                  id: invocationId,
+                  capabilityId: capability.id,
+                  callerId: actorId,
+                  input: action.input,
+                  accepted: false,
+                  success: false,
+                  chargedCost: ZERO_RESOURCES,
+                  createdTick: tick,
+                  localIndex: decision.localIndex,
+                  reason: "insufficient_resources",
+                },
+              }),
+            });
+            return;
+          }
+          const paymentTo = capability.ownerId === actorId ? "@treasury" : capability.ownerId;
           await this.#commit({
-            tick, phase: "resolution", type: "capability.used", actorId,
-            data: toJsonObject({ agentId: actorId, capabilityId: action.capabilityId, input: action.input, success: true }),
+            tick,
+            phase: "resolution",
+            type: "capability.used",
+            actorId,
+            targetId: capability.ownerId,
+            causationId: payment.eventId,
+            data: toJsonObject({
+              invocation: {
+                id: invocationId,
+                capabilityId: capability.id,
+                callerId: actorId,
+                input: action.input,
+                accepted: true,
+                success: true,
+                output,
+                chargedCost: capability.cost,
+                paymentTo,
+                createdTick: tick,
+                localIndex: decision.localIndex,
+              },
+            }),
           });
           return;
         }
@@ -454,6 +624,7 @@ export class LogicalUniverse {
           if (this.#world.agents[actorId]!.resources[action.resource] < action.amount) throw new Error(`Insufficient ${action.resource}`);
           await this.#commit({
             tick, phase: "resolution", type: "resource.transferred", actorId, targetId: action.targetId,
+            causationId: payment.eventId,
             data: { fromId: actorId, toId: action.targetId, resource: action.resource, amount: action.amount },
           });
           return;
@@ -466,26 +637,26 @@ export class LogicalUniverse {
           return;
       }
     } catch (error) {
-      await this.#violation(actorId, action.type, errorMessage(error), tick);
+      await this.#violation(actorId, action.type, errorMessage(error), tick, payment.eventId);
     }
   }
 
-  async #pay(actorId: string, action: PrimitiveActionType, tick: number): Promise<boolean> {
+  async #pay(actorId: string, action: PrimitiveActionType, tick: number): Promise<LabEvent | undefined> {
     let cost: ResourceVector;
     try {
       cost = this.#physics.scaledCost(this.config.costs[action], this.#world.physics);
     } catch (error) {
       await this.#violation(actorId, action, `cost unavailable: ${errorMessage(error)}`, tick);
-      return false;
+      return undefined;
     }
     const agent = this.#world.agents[actorId]!;
     if (!this.#physics.canAfford(agent.resources, cost)) {
       // Exhaustion is an enforced physical boundary, not malicious behavior.
       // The rejected attempt changes no state and cannot create an unbounded
       // violation-event storm after a balance reaches zero.
-      return false;
+      return undefined;
     }
-    await this.#commit({
+    return this.#commit({
       tick,
       phase: "resolution",
       type: "resource.spent",
@@ -496,7 +667,6 @@ export class LogicalUniverse {
         action,
       }),
     });
-    return true;
   }
 
   async #evaluate(submissionIds: readonly string[], tick: number): Promise<void> {
@@ -507,8 +677,9 @@ export class LogicalUniverse {
       if (!task) continue;
       try {
         const evaluation = this.#evaluator.evaluate(task, submission.id, submission.agentId, submission.result, tick);
-        await this.#commit({
+        const evaluated = await this.#commit({
           tick, phase: "evaluation", type: "task.evaluated", actorId: submission.agentId,
+          causationId: submission.submittedEventId,
           data: toJsonObject({ ...evaluation, completedTick: tick }),
         });
         if (
@@ -524,6 +695,7 @@ export class LogicalUniverse {
               type: "resource.transferred",
               actorId: "@treasury",
               targetId: submission.agentId,
+              causationId: evaluated.eventId,
               data: {
                 fromId: "@treasury",
                 toId: submission.agentId,
@@ -541,24 +713,28 @@ export class LogicalUniverse {
     }
   }
 
-  async #violation(actorId: string, action: PrimitiveActionType, reason: string, tick: number): Promise<void> {
+  async #violation(
+    actorId: string,
+    action: PrimitiveActionType,
+    reason: string,
+    tick: number,
+    causationId?: string,
+  ): Promise<void> {
     await this.#commit({
       tick,
       phase: "resolution",
       type: "violation.recorded",
       actorId,
+      ...(causationId === undefined ? {} : { causationId }),
       data: { agentId: actorId, action, reason, count: 1 },
     });
   }
 
   async #commit(draft: LabEventDraft): Promise<LabEvent> {
     const preview = createLabEvent(this.manifest, draft, this.recorder.lastSeq + 1, this.recorder.lastHash);
-    const next = reduceWorldEvent(this.#world, preview);
-    const appended = await this.recorder.append(draft);
-    if (appended.hash !== preview.hash || appended.seq !== preview.seq) {
-      throw new Error("Recorder changed between event preview and append");
-    }
-    this.#world = next;
+    const transition = prepareWorldEventTransition(this.#world, preview);
+    const appended = await this.recorder.appendPrepared(preview);
+    this.#world = transition.apply(appended);
     return appended;
   }
 
@@ -634,14 +810,6 @@ function safePpmMultiply(value: number, multiplierPpm: number): number {
 
 function toJsonObject(value: unknown): JsonObject {
   return structuredClone(value) as JsonObject;
-}
-
-function deepFreeze<T>(value: T): T {
-  if (value && typeof value === "object" && !Object.isFrozen(value)) {
-    Object.freeze(value);
-    for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested);
-  }
-  return value;
 }
 
 function errorMessage(error: unknown): string {

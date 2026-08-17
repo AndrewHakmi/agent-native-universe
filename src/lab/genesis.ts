@@ -30,7 +30,12 @@ export async function runGenesis(options: GenesisRunOptions): Promise<RunSummary
   const config = structuredClone(options.config);
   validateGenesisConfig(config);
   const manifest = createRunManifest(config, options.universeId);
-  const evidence = new EvidenceStore(options.runsRoot, manifest.experimentId, manifest.universeId);
+  const evidence = new EvidenceStore(
+    options.runsRoot,
+    manifest.experimentId,
+    manifest.universeId,
+    { retainEvents: false, runId: manifest.runId },
+  );
   const releaseLease = await evidence.acquireWriterLease(manifest.runId);
 
   try {
@@ -47,12 +52,10 @@ export async function runGenesis(options: GenesisRunOptions): Promise<RunSummary
       onMetrics: (metrics) => evidence.appendMetrics(metrics),
       onCheckpoint: (checkpoint) => evidence.writeCheckpoint(checkpoint),
     });
-    await universe.initialize();
-    await universe.run();
+    const liveState = await universe.run();
     await evidence.flush();
 
-    const liveState = universe.state();
-    const replay = ReplayEngine.replay(evidence.events.events(), manifest);
+    const replay = await ReplayEngine.replayFile(evidence.eventsPath, manifest, config);
     assertReplayEquivalent(liveState, replay, config);
     const summary = await createSummary(evidence, manifest, config, replay);
     await evidence.writeSummary(summary);
@@ -78,7 +81,7 @@ async function recoverCompletedRun(
     return undefined;
   }
 
-  const replay = ReplayEngine.replay(evidence.events.events(), manifest);
+  const replay = await ReplayEngine.replayFile(evidence.eventsPath, manifest, config);
   if (!replay.state.completed) {
     if (stored) throw new EvidenceConflictError("A summary exists for an incomplete event stream");
     return undefined;

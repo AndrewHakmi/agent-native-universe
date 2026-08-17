@@ -65,6 +65,7 @@ test("observer serves deterministic, paginated and redacted evidence over real H
       universeId: "U0001",
       seed: "seed-alpha",
       apiKey: "must-never-leak",
+      authToken: "auth-token-must-never-leak",
     },
     {
       schemaVersion: 1,
@@ -72,6 +73,7 @@ test("observer serves deterministic, paginated and redacted evidence over real H
       ticks: 20,
       events: 4,
       credentials: "also-must-never-leak",
+      csrfToken: "csrf-token-must-never-leak",
     },
     [
       { seq: 1, type: "run.started", data: {} },
@@ -79,6 +81,19 @@ test("observer serves deterministic, paginated and redacted evidence over real H
       { seq: 3, type: "task.evaluated", data: { accepted: true } },
       { seq: 4, type: "run.completed", data: { note: "password=hunter2" } },
     ],
+  );
+  await writeRun(
+    dataDir,
+    "runs/genesis-1/U0001/run:addressed",
+    {
+      schemaVersion: 1,
+      experimentId: "genesis-1",
+      runId: "run:addressed",
+      universeId: "U0001",
+      seed: "seed-addressed",
+    },
+    { schemaVersion: 1, runId: "run:addressed", ticks: 1, events: 1 },
+    [{ seq: 1, type: "run.started", data: {} }],
   );
 
   const baseUrl = await startFixture(t, dataDir);
@@ -105,17 +120,26 @@ test("observer serves deterministic, paginated and redacted evidence over real H
   const runsResponse = await fetch(`${baseUrl}/api/runs`);
   assert.equal(runsResponse.status, 200);
   const runs = await runsResponse.json();
-  assert.equal(runs.count, 2);
-  assert.deepEqual(runs.runs.map((run) => run.runId), ["alpha-run", "zeta-run"]);
-  assert.deepEqual(runs.runs.map((run) => run.universeId), ["U0001", "U0002"]);
+  assert.equal(runs.count, 3);
+  assert.deepEqual(runs.runs.map((run) => run.runId), ["alpha-run", "run:addressed", "zeta-run"]);
+  assert.deepEqual(runs.runs.map((run) => run.universeId), ["U0001", "U0001", "U0002"]);
+
+  const addressedDetailResponse = await fetch(`${baseUrl}/api/runs/run%3Aaddressed`);
+  assert.equal(addressedDetailResponse.status, 200);
+  assert.equal((await addressedDetailResponse.json()).runId, "run:addressed");
 
   const detailResponse = await fetch(`${baseUrl}/api/runs/alpha-run`);
   assert.equal(detailResponse.status, 200);
   const detailText = await detailResponse.text();
-  assert.doesNotMatch(detailText, /must-never-leak|also-must-never-leak/);
+  assert.doesNotMatch(
+    detailText,
+    /must-never-leak|also-must-never-leak|auth-token-must-never-leak|csrf-token-must-never-leak/,
+  );
   const detail = JSON.parse(detailText);
   assert.equal(detail.manifest.apiKey, "[REDACTED]");
+  assert.equal(detail.manifest.authToken, "[REDACTED]");
   assert.equal(detail.summary.credentials, "[REDACTED]");
+  assert.equal(detail.summary.csrfToken, "[REDACTED]");
 
   const firstPageResponse = await fetch(`${baseUrl}/api/runs/alpha-run/events?after=1&limit=2`);
   assert.equal(firstPageResponse.status, 200);
@@ -171,6 +195,90 @@ test("observer rejects writes, traversal and unsafe or unbounded queries", async
   assert.equal(duplicateCursor.status, 400);
   const unknownQuery = await fetch(`${baseUrl}/api/runs/safe-run/events?path=/etc/passwd`);
   assert.equal(unknownQuery.status, 400);
+});
+
+test("observer never selects one of two evidence directories with the same run id", async (t) => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "anu-observer-duplicate-"));
+  t.after(() => rm(fixtureRoot, { recursive: true, force: true }));
+  const dataDir = join(fixtureRoot, "data");
+  await mkdir(dataDir);
+  const duplicateManifest = {
+    schemaVersion: 1,
+    experimentId: "genesis-1",
+    runId: "duplicate-run",
+    universeId: "U0001",
+  };
+  await writeRun(dataDir, "copy-a", duplicateManifest, null);
+  await writeRun(dataDir, "copy-b", duplicateManifest, null);
+  await writeRun(
+    dataDir,
+    "unique",
+    { ...duplicateManifest, runId: "unique-run", universeId: "U0002" },
+    null,
+  );
+
+  const baseUrl = await startFixture(t, dataDir);
+  const catalogueResponse = await fetch(`${baseUrl}/api/runs`);
+  assert.equal(catalogueResponse.status, 409);
+  assert.deepEqual(await catalogueResponse.json(), { error: "ambiguous_run_evidence" });
+  for (const runId of ["duplicate-run", "unique-run"]) {
+    const response = await fetch(`${baseUrl}/api/runs/${runId}`);
+    assert.equal(response.status, 409);
+    assert.deepEqual(await response.json(), { error: "ambiguous_run_evidence" });
+  }
+});
+
+test("observer never resolves a run when discovery exceeds the catalogue bound", async (t) => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "anu-observer-boundary-"));
+  t.after(() => rm(fixtureRoot, { recursive: true, force: true }));
+  const dataDir = join(fixtureRoot, "data");
+  await mkdir(dataDir);
+
+  for (let start = 0; start < 1_000; start += 50) {
+    const end = Math.min(start + 50, 1_000);
+    await Promise.all(Array.from({ length: end - start }, (_, offset) => {
+      const index = start + offset;
+      return writeRun(
+        dataDir,
+        `directory-${String(index).padStart(4, "0")}`,
+        {
+          schemaVersion: 1,
+          experimentId: "genesis-1",
+          runId: `boundary-run-${String(index).padStart(4, "0")}`,
+          universeId: `U${String(index + 1).padStart(4, "0")}`,
+        },
+        null,
+      );
+    }));
+  }
+
+  const baseUrl = await startFixture(t, dataDir);
+  const exactLimitResponse = await fetch(`${baseUrl}/api/runs`);
+  assert.equal(exactLimitResponse.status, 200);
+  const exactLimit = await exactLimitResponse.json();
+  assert.equal(exactLimit.count, 1_000);
+  assert.equal(exactLimit.truncated, false);
+
+  await writeRun(
+    dataDir,
+    "directory-1000",
+    {
+      schemaVersion: 1,
+      experimentId: "genesis-1",
+      runId: "boundary-run-0000",
+      universeId: "U1001",
+    },
+    null,
+  );
+  for (const path of [
+    "/api/runs",
+    "/api/runs/boundary-run-0000",
+    "/api/runs/boundary-run-0999/events",
+  ]) {
+    const response = await fetch(`${baseUrl}${path}`);
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), { error: "run_discovery_incomplete" });
+  }
 });
 
 test("observer ignores symlinked runs and never follows symlinked artifacts", async (t) => {

@@ -149,6 +149,28 @@ resource physics, hidden-oracle task evaluation, external pressure, hash-chained
 JSONL evidence, evaluator-backed rewards, checkpoints, exact replay, fixed-point
 metrics, bounded parallel populations, and a read-only Observer API.
 
+The current manifest-bound engine identity is `genesis-logical-v1.1.0`.
+Accepted messages now produce an explicit causal
+`message.sent` → `message.delivered` pair and enter the recipient's inbox; each
+observation exposes a deterministic window of at most 64 delivered messages.
+Agents can publish independent submission attestations without changing hidden
+evaluator truth, and can execute a bounded, side-effect-free JSON capability DSL
+(`copy`, `sum`, `concat`, and `literal`) with the declared resource payment.
+
+Long-run evidence uses a non-retaining recorder and streaming full-chain replay.
+Each immutable run identity has an isolated `experiment/universe/runId`
+directory. Replay requires `--run-id` when more than one compatible run exists,
+rejects incompatible engine identities, and uses the stored config to regenerate
+the deterministic neutral-policy decision stream and complete terminal protocol
+rather than trusting hash-valid event semantics.
+The Observer keeps a bounded, sparse in-memory cursor index so high `after`
+cursors can be served from logs larger than 64 MiB without changing the public
+`after`/`limit` API. These changes reduce memory and scan pressure; they are not
+yet evidence that the full reference population runs within production limits.
+The internal Observer remains unauthenticated on its isolated control network.
+The opt-in edge role loads a strong Bearer token from a Docker-mounted file and
+enforces it inside the application as well as retaining Traefik authentication.
+
 Run a conservative local experiment and verify it by replay:
 
 ```bash
@@ -164,11 +186,14 @@ node dist/lab/runner.js population \
   --config ./experiments/genesis-1/config.json \
   --data-dir ./runs \
   --universes 32 \
-  --parallel 8
+  --parallel 2
 ```
 
+For a 2 GB runner limit, `--parallel 2` is a starting engineering estimate,
+not a completed live benchmark of 32 universes with 64 agents × 10,000 ticks.
+
 See [Universe Lab](docs/UNIVERSE_LAB.md) for the scientific boundary, evidence
-model, commands, and current logical-v1 limitations. See
+model, commands, and current logical-v1.1 limitations. See
 [Lab deployment](docs/LAB_DEPLOYMENT.md) for the hardened Docker/Traefik stand.
 
 ## Imports
