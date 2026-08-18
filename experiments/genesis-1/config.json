@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "experimentId": "genesis-1",
+  "seed": "genesis-1",
+  "ticks": 10000,
+  "agents": 64,
+  "metricEvery": 100,
+  "checkpointEvery": 100,
+  "initialResources": {
+    "credits": 1000,
+    "llmTokens": 100000,
+    "computeMs": 100000,
+    "storageBytes": 1000000,
+    "bandwidthBytes": 1000000
+  },
+  "treasuryResources": {
+    "credits": 36000,
+    "llmTokens": 3600000,
+    "computeMs": 43600000,
+    "storageBytes": 9936000000,
+    "bandwidthBytes": 9936000000
+  },
+  "acceptedTaskReward": {
+    "credits": 5,
+    "llmTokens": 0,
+    "computeMs": 0,
+    "storageBytes": 0,
+    "bandwidthBytes": 0
+  },
+  "costs": {
+    "observe": { "credits": 1, "llmTokens": 0, "computeMs": 1, "storageBytes": 0, "bandwidthBytes": 64 },
+    "reason": { "credits": 2, "llmTokens": 0, "computeMs": 4, "storageBytes": 0, "bandwidthBytes": 0 },
+    "send": { "credits": 1, "llmTokens": 0, "computeMs": 1, "storageBytes": 0, "bandwidthBytes": 256 },
+    "connect": { "credits": 3, "llmTokens": 0, "computeMs": 2, "storageBytes": 0, "bandwidthBytes": 128 },
+    "disconnect": { "credits": 1, "llmTokens": 0, "computeMs": 1, "storageBytes": 0, "bandwidthBytes": 64 },
+    "store": { "credits": 1, "llmTokens": 0, "computeMs": 1, "storageBytes": 256, "bandwidthBytes": 0 },
+    "retrieve": { "credits": 1, "llmTokens": 0, "computeMs": 1, "storageBytes": 0, "bandwidthBytes": 0 },
+    "execute": { "credits": 3, "llmTokens": 0, "computeMs": 12, "storageBytes": 0, "bandwidthBytes": 0 },
+    "verify": { "credits": 2, "llmTokens": 0, "computeMs": 6, "storageBytes": 0, "bandwidthBytes": 64 },
+    "spawn": { "credits": 1000, "llmTokens": 0, "computeMs": 1000, "storageBytes": 4096, "bandwidthBytes": 0 },
+    "clone": { "credits": 750, "llmTokens": 0, "computeMs": 750, "storageBytes": 4096, "bandwidthBytes": 0 },
+    "merge": { "credits": 500, "llmTokens": 0, "computeMs": 500, "storageBytes": 2048, "bandwidthBytes": 128 },
+    "reserve": { "credits": 1, "llmTokens": 0, "computeMs": 1, "storageBytes": 0, "bandwidthBytes": 0 },
+    "transfer": { "credits": 1, "llmTokens": 0, "computeMs": 1, "storageBytes": 0, "bandwidthBytes": 64 },
+    "trade": { "credits": 2, "llmTokens": 0, "computeMs": 2, "storageBytes": 0, "bandwidthBytes": 128 },
+    "publishCapability": { "credits": 8, "llmTokens": 0, "computeMs": 20, "storageBytes": 1024, "bandwidthBytes": 256 },
+    "useCapability": { "credits": 3, "llmTokens": 0, "computeMs": 8, "storageBytes": 0, "bandwidthBytes": 128 },
+    "claimTask": { "credits": 1, "llmTokens": 0, "computeMs": 1, "storageBytes": 0, "bandwidthBytes": 64 },
+    "submit": { "credits": 1, "llmTokens": 0, "computeMs": 1, "storageBytes": 0, "bandwidthBytes": 256 }
+  },
+  "taskStream": {
+    "families": [
+      "arithmetic",
+      "json_transform",
+      "memory_recall",
+      "correlation",
+      "verification",
+      "multi_step",
+      "concurrency",
+      "state_recovery"
+    ],
+    "tasksPerTick": 1,
+    "deadlineTicks": 100,
+    "maxBacklog": 2048
+  },
+  "pressures": [
+    { "tick": 2000, "type": "resource_price_multiplier", "resource": "credits", "multiplierPpm": 10000000 },
+    { "tick": 3500, "type": "bandwidth_capacity_multiplier", "multiplierPpm": 100000 },
+    { "tick": 5000, "type": "retire_agent_fraction", "fractionPpm": 200000 },
+    { "tick": 6500, "type": "task_load_multiplier", "multiplierPpm": 10000000 }
+  ]
+}

@@ -1,0 +1,17 @@
+.git
+.github
+.codebase-memory
+node_modules
+dist
+dist-test
+coverage
+.anu-state
+data
+logs
+runs
+*.log
+npm-debug.log*
+.env
+.env.*
+!.env.example
+.DS_Store

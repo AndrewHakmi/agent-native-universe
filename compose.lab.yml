@@ -1,0 +1,158 @@
+name: anu-lab
+
+x-lab-runtime: &lab-runtime
+  build:
+    context: .
+    dockerfile: Dockerfile.lab
+  image: ${ANU_LAB_IMAGE:-agent-native-universe-lab:local}
+  init: true
+  user: "1000:1000"
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  pids_limit: 256
+  cpus: ${ANU_LAB_CPUS:-2.0}
+  mem_limit: ${ANU_LAB_MEMORY_LIMIT:-2g}
+  stop_grace_period: 45s
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  lab-observer:
+    <<: *lab-runtime
+    restart: unless-stopped
+    command:
+      - node
+      - dist/lab/runner.js
+      - serve
+      - --data-dir
+      - /data
+      - --port
+      - "3000"
+    volumes:
+      - lab-evidence:/data:ro
+    expose:
+      - "3000"
+    networks:
+      - control
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/readyz').then((response)=>process.exit(response.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    labels:
+      traefik.enable: "false"
+
+  # Public routing is deliberately opt-in. It requires both a file-mounted
+  # application Bearer token and a rotated Traefik authentication middleware.
+  lab-observer-edge:
+    <<: *lab-runtime
+    profiles:
+      - edge
+    restart: unless-stopped
+    command:
+      - node
+      - dist/lab/runner.js
+      - serve
+      - --data-dir
+      - /data
+      - --port
+      - "3000"
+      - --auth-token-file
+      - /run/secrets/anu_lab_observer_token
+    secrets:
+      - source: anu_lab_observer_token
+        target: anu_lab_observer_token
+    volumes:
+      - lab-evidence:/data:ro
+    expose:
+      - "3000"
+    networks:
+      - edge
+      - control
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/readyz').then((response)=>process.exit(response.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: "dev-studyninja-network"
+      traefik.http.routers.anu-lab-observer.rule: "Host(`${ANU_LAB_HOST:-lab.anu.xteam.pro}`)"
+      traefik.http.routers.anu-lab-observer.entrypoints: "websecure"
+      traefik.http.routers.anu-lab-observer.tls: "true"
+      traefik.http.routers.anu-lab-observer.tls.certresolver: "letsencrypt"
+      traefik.http.routers.anu-lab-observer.middlewares: "${ANU_LAB_AUTH_MIDDLEWARE:-anu-lab-auth-required@docker},anu-lab-security@docker,anu-lab-rate-limit@docker,anu-lab-inflight@docker"
+      traefik.http.routers.anu-lab-observer.service: "anu-lab-observer"
+      traefik.http.services.anu-lab-observer.loadbalancer.server.port: "3000"
+      traefik.http.services.anu-lab-observer.loadbalancer.healthcheck.path: "/readyz"
+      traefik.http.services.anu-lab-observer.loadbalancer.healthcheck.interval: "15s"
+      traefik.http.services.anu-lab-observer.loadbalancer.healthcheck.timeout: "5s"
+      traefik.http.middlewares.anu-lab-security.headers.contenttypenosniff: "true"
+      traefik.http.middlewares.anu-lab-security.headers.framedeny: "true"
+      traefik.http.middlewares.anu-lab-security.headers.referrerpolicy: "no-referrer"
+      traefik.http.middlewares.anu-lab-security.headers.forcestsheader: "true"
+      traefik.http.middlewares.anu-lab-security.headers.stsseconds: "31536000"
+      traefik.http.middlewares.anu-lab-rate-limit.ratelimit.average: "20"
+      traefik.http.middlewares.anu-lab-rate-limit.ratelimit.period: "1s"
+      traefik.http.middlewares.anu-lab-rate-limit.ratelimit.burst: "40"
+      traefik.http.middlewares.anu-lab-inflight.inflightreq.amount: "32"
+
+  lab-runner:
+    <<: *lab-runtime
+    profiles:
+      - runner
+    restart: "no"
+    command:
+      - node
+      - dist/lab/runner.js
+      - run
+      - --data-dir
+      - /data
+      - --universes
+      - ${ANU_LAB_UNIVERSES:-1}
+      - --agents
+      - ${ANU_LAB_AGENTS:-16}
+      - --ticks
+      - ${ANU_LAB_TICKS:-500}
+    volumes:
+      - lab-evidence:/data
+    networks:
+      - control
+    healthcheck:
+      disable: true
+
+networks:
+  edge:
+    external: true
+    name: dev-studyninja-network
+  control:
+    driver: bridge
+    internal: true
+
+volumes:
+  lab-evidence:
+    driver: local
+
+secrets:
+  anu_lab_observer_token:
+    # Keep the real file outside the repository. /dev/null makes edge startup
+    # fail closed while allowing the default Compose model to be validated.
+    file: ${ANU_LAB_OBSERVER_TOKEN_FILE:-/dev/null}
