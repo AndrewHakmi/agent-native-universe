@@ -1,9 +1,17 @@
 import type { JsonObject, JsonValue } from "../core/types.js";
 import { compareCodeUnits } from "./canonical.js";
-import type { LabTaskState, TaskFamily, TaskStreamConfig } from "./types.js";
+import type {
+  DeterministicRngCheckpoint,
+  LabTaskState,
+  TaskFamily,
+  TaskStreamCheckpoint,
+  TaskStreamConfig,
+} from "./types.js";
 
 export interface TaskRandomSource {
   nextInt(maxExclusive: number): number;
+  checkpoint?(): DeterministicRngCheckpoint;
+  restore?(checkpoint: DeterministicRngCheckpoint): void;
 }
 
 export interface GeneratedTask {
@@ -56,6 +64,22 @@ export class DeterministicTaskStream {
       });
     }
     return generated;
+  }
+
+  checkpoint(): TaskStreamCheckpoint {
+    if (this.rng.checkpoint === undefined) {
+      throw new Error("Task RNG does not expose deterministic checkpoint state");
+    }
+    return { sequence: this.#sequence, rng: this.rng.checkpoint() };
+  }
+
+  restore(checkpoint: TaskStreamCheckpoint): void {
+    nonNegativeSafeInteger(checkpoint.sequence, "task checkpoint sequence");
+    if (this.rng.restore === undefined) {
+      throw new Error("Task RNG does not support deterministic restoration");
+    }
+    this.rng.restore(checkpoint.rng);
+    this.#sequence = checkpoint.sequence;
   }
 }
 

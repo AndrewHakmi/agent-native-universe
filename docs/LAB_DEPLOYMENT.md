@@ -38,11 +38,14 @@ evidence directory prevents a false healthy state. Both probe routes remain
 unauthenticated inside the application. When `--auth-token-file` is present,
 all evidence routes require one exact `Authorization: Bearer <token>` header.
 
-The current logical runner is intended to finish normally. Do not terminate a
-scientific run: an interrupted append-only stream is preserved for diagnosis
-and is deliberately not resumed in logical v1.1. The long-running observer does
-handle `SIGTERM` gracefully. Durable tick-boundary cancellation/resume remains
-a prerequisite for long population jobs.
+The logical runner handles SIGINT and SIGTERM at durable tick boundaries. The
+active tick completes, deterministic runtime state and world state are flushed
+to an immutable checkpoint, child workers release their writer leases, and the
+CLI reports `paused`. Re-running the identical command automatically resumes
+only after semantic replay matches that checkpoint and the event-chain tail.
+Mid-tick crash evidence is never truncated or silently repaired and therefore
+still requires diagnosis. The long-running observer handles `SIGTERM`
+gracefully as before.
 
 ## Infrastructure prerequisites
 
@@ -116,9 +119,11 @@ docker compose -f compose.lab.yml --profile runner run --rm lab-runner
 
 Large runs are intentionally opt-in. The current server should be benchmarked
 before increasing concurrency or running many physical node containers. The
-checked-in Compose command retains CLI parallelism 1. With the 2 GB memory
-limit, `--parallel 2` is a conservative next starting estimate for an explicit
-population run, pending a live benchmark. The complete target of 32 universes
+checked-in Compose command retains CLI parallelism 1. Production population
+workers are separate Node.js processes, so `--parallel` now controls real
+multi-core concurrency and multiplies per-universe memory pressure. With the 2
+GB memory limit, `--parallel 2` is a conservative next starting estimate for an
+explicit population run, pending a live benchmark. The complete target of 32 universes
 with 64 agents × 10,000 ticks has not yet been completed under this limit and
 must not be treated as validated production capacity.
 

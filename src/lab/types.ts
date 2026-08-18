@@ -411,6 +411,32 @@ export type TickPhase =
   | "checkpoint"
   | "completion";
 
+export interface DeterministicRngCheckpoint {
+  algorithm: "xoshiro256**";
+  streamSeed: string;
+  state: [string, string, string, string];
+}
+
+export interface TaskStreamCheckpoint {
+  sequence: number;
+  rng: DeterministicRngCheckpoint;
+}
+
+export interface NeutralPolicyCheckpoint {
+  policyId: string;
+  explorationPpm: number;
+  streams: Array<{
+    agentId: string;
+    rng: DeterministicRngCheckpoint;
+  }>;
+}
+
+export interface CheckpointRuntimeState {
+  taskStream: TaskStreamCheckpoint;
+  /** Null means the selected custom policy did not expose resumable state. */
+  policy: NeutralPolicyCheckpoint | null;
+}
+
 export interface Checkpoint {
   schemaVersion: typeof LAB_SCHEMA_VERSION;
   runId: string;
@@ -420,6 +446,9 @@ export interface Checkpoint {
   eventHash: string;
   stateHash: string;
   state: WorldState;
+  /** Added compatibly: legacy checkpoints remain verifiable but are not resumable. */
+  runtime?: CheckpointRuntimeState;
+  runtimeHash?: string;
 }
 
 export interface RunSummary {

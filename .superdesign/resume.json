@@ -16,17 +16,17 @@
         ".superdesign/design-system.md": "912aeec0962c1d99c072ff1a3057ed6aa78b7ad478e5bfe2efd7e847069b7c5b",
         ".superdesign/init/routes.md": "f91ee308783d4dd70a4766037a73d17f43ccd2fae60cbe1952af02c86333093c",
         ".superdesign/init/theme.md": "31822610e5e911dcc419aa118b7f5c7d5c028c0704a88e0d8ff959f1559cabe9",
-        "src/lab/types.ts": "1ce741f5ad0213457b59d708c4416a3c5f10623c7ac48a69a58ff50017af3dcd"
+        "src/lab/types.ts": "a36df65cb7f97da36b15716975da3fab22e53984ed32bd238faff6fefe13ca1b"
       },
       "components": [],
       "drafts": {
         "6cd7ce72-d333-4dd1-ab85-e6c62aaa71f9": {
-          "title": "ANU Observer Instrument Dashboard",
+          "title": "ANU Observer Canonical Dashboard (1920x1080 Refined)",
           "visualDirection": "scientific cartography",
-          "currentVersion": 1
+          "currentVersion": 2
         }
       },
-      "updatedAt": "2026-08-17T05:43:43Z"
+      "updatedAt": "2026-08-18T22:52:27Z"
     }
   }
 }

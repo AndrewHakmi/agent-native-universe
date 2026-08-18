@@ -111,8 +111,12 @@ previous hash, and SHA-256 event hash. Writes are serialized through one
 recorder. The Genesis run path disables the recorder's in-memory event copy, and
 file replay reads one record at a time while verifying the complete hash chain.
 Genesis completion additionally compares replayed and live state hashes.
-Immutable artifacts refuse conflicting replacement, and incomplete evidence is
-preserved for diagnosis rather than silently resumed or deleted.
+Immutable artifacts refuse conflicting replacement. An incomplete stream is
+resumed only when it ends at a verified `tick.completed` boundary and its latest
+checkpoint matches independently replayed world state, event-chain tail, task
+generator state, and per-agent neutral-policy RNG streams. Mid-tick evidence,
+legacy checkpoints without runtime state, and mismatches remain preserved for
+diagnosis and fail closed instead of being truncated or rewritten.
 
 Authoritative replay requires the stored `config.json`; the config hash, seed,
 experiment, deterministic run ID, and manifest implementation identity must all
@@ -140,6 +144,12 @@ historical engine.
 Checkpoints still serialize the complete projected world state. Frequent
 checkpoints can therefore amplify disk use even though event recording and
 replay no longer materialize the complete event log in memory.
+SIGINT or SIGTERM requests a boundary pause: the active tick completes, a
+durable checkpoint is flushed, and the writer lease is released. Re-running
+the same deterministic command automatically resumes that run; a completed run
+remains idempotent. Production population universes execute in separate Node.js
+processes bounded by `--parallel`, while result ordering and scientific hashes
+remain independent of process scheduling.
 Manifest, config, summary, attestation, and metrics reads are bounded; an
 individual checkpoint above 64 MiB is rejected instead of being materialized
 into process memory. The reference configuration remains below that per-file
@@ -235,7 +245,7 @@ node dist/lab/runner.js serve --data-dir ./runs --host 0.0.0.0 --port 3000 \
 The same surface is available as `anu lab ...`. With no `--config`, the runner
 uses a conservative 16-agent, 500-tick configuration suitable for a smoke run.
 Under the Compose 2 GB memory ceiling, population parallelism 2 is a starting
-engineering estimate pending a live full-population benchmark; it is not a
+engineering estimate pending a live process-worker benchmark; it is not a
 validated capacity guarantee.
 
 The policy scheduler now creates one immutable, redacted per-tick observation

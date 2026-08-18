@@ -18,6 +18,7 @@ import { DeterministicRng } from "./rng.js";
 import { DeterministicTaskStream, type GeneratedTask } from "./task-stream.js";
 import {
   PPM,
+  type CheckpointRuntimeState,
   type GenesisConfig,
   type LabEvent,
   type LabEventType,
@@ -283,17 +284,36 @@ export class LabProtocolVerifier {
     }
   }
 
-  finish(): void {
+  finish(options: { allowIncompleteBoundary?: boolean } = {}): void {
     if (!this.#started) throw new ProtocolVerificationError("Event stream has no run.started event");
     if (this.#genesisAgentIndex !== this.#genesisAgents.length) {
       throw new ProtocolVerificationError("Event stream ends before the complete genesis population");
     }
     if (!this.#completed) {
-      throw new ProtocolVerificationError("Event stream ends before run.completed");
+      if (!options.allowIncompleteBoundary) {
+        throw new ProtocolVerificationError("Event stream ends before run.completed");
+      }
+      if (this.#currentTick !== 0 && !this.#tickCompleted) {
+        throw new ProtocolVerificationError("Incomplete event stream does not end at a durable tick boundary");
+      }
+      return;
     }
     if (!this.#tickCompleted || this.#currentTick !== this.config.ticks) {
       throw new ProtocolVerificationError("Completed event stream has an invalid terminal tick");
     }
+  }
+
+  checkpointRuntime(): CheckpointRuntimeState {
+    if (!this.#started || this.#genesisAgentIndex !== this.#genesisAgents.length) {
+      throw new ProtocolVerificationError("Cannot checkpoint before complete genesis");
+    }
+    if (this.#currentTick !== 0 && !this.#tickCompleted) {
+      throw new ProtocolVerificationError("Cannot checkpoint inside an incomplete tick");
+    }
+    return {
+      taskStream: this.#tasks.checkpoint(),
+      policy: this.#policy.checkpoint(),
+    };
   }
 
   #verifyGenesis(event: LabEvent): boolean {

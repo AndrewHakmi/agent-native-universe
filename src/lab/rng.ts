@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { canonicalJson } from "./canonical.js";
+import type { DeterministicRngCheckpoint } from "./types.js";
 
 const MASK_64 = (1n << 64n) - 1n;
 const UINT64_RANGE = 1n << 64n;
@@ -78,6 +79,36 @@ export class DeterministicRng {
       shuffled[other] = currentValue;
     }
     return shuffled;
+  }
+
+  checkpoint(): DeterministicRngCheckpoint {
+    return {
+      algorithm: "xoshiro256**",
+      streamSeed: this.#streamSeed,
+      state: this.#state.map((word) => word.toString(16).padStart(16, "0")) as [
+        string,
+        string,
+        string,
+        string,
+      ],
+    };
+  }
+
+  restore(checkpoint: DeterministicRngCheckpoint): void {
+    if (checkpoint.algorithm !== "xoshiro256**" || checkpoint.streamSeed !== this.#streamSeed) {
+      throw new Error("RNG checkpoint belongs to another deterministic stream");
+    }
+    if (!Array.isArray(checkpoint.state) || checkpoint.state.length !== 4) {
+      throw new Error("RNG checkpoint must contain four state words");
+    }
+    const state = checkpoint.state.map((word) => {
+      if (typeof word !== "string" || !/^[0-9a-f]{16}$/.test(word)) {
+        throw new Error("RNG checkpoint state words must be lowercase 64-bit hex");
+      }
+      return BigInt(`0x${word}`);
+    }) as [bigint, bigint, bigint, bigint];
+    if (state.every((word) => word === 0n)) throw new Error("RNG checkpoint state must not be zero");
+    this.#state = state;
   }
 }
 

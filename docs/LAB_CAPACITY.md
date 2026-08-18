@@ -9,9 +9,11 @@ not evidence that the complete reference population has finished successfully.
 and 10,000 ticks. The intended population contains 32 independent universes.
 The reference task pressure produces 41,509 historical tasks per universe.
 
-`runPopulation()` currently schedules asynchronous workers inside one Node.js
-process. Higher `--parallel` values overlap I/O but do not make CPU-bound policy
-and reducer work execute on multiple JavaScript cores.
+`runPopulation()` now executes production universes in separate bounded Node.js
+processes. `--parallel` is the maximum number of simultaneously active child
+processes, so CPU-bound policy and reducer work can use multiple cores.
+Injected test/integration executors remain in-process and are independently
+verified before their output can enter a population catalogue.
 
 ## Per-tick observation projection
 
@@ -98,10 +100,16 @@ The policy hot path is materially improved, but the complete
 1. eliminate full task-history scans in expiry/backlog maintenance;
 2. benchmark an anchored persistent event writer instead of open/write/close
    for every event;
-3. add process-based workers for real multi-core population execution;
-4. define a lower-amplification checkpoint/resume format;
+3. replace full-world checkpoints with a lower-amplification representation;
+4. profile process-worker CPU, RSS, IPC, and evidence-writer contention;
 5. run one 64-agent × 10,000-tick canary with disk and RSS telemetry;
 6. only then scale the same immutable config to 32 universes.
+
+Tick-boundary pause/resume is now durable: a checkpoint includes deterministic
+task-generator and neutral-policy RNG state, and resume requires independent
+semantic replay to match the checkpoint state, event-chain tail, and runtime
+hash. This improves operability but does not reduce snapshot size; checkpoints
+still contain the complete projected world.
 
 Interrupted and failed runs are intentionally preserved as diagnostic evidence,
 so capacity planning must reserve space for unsuccessful attempts as well as the

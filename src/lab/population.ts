@@ -1,7 +1,9 @@
 import { isUtf8 } from "node:buffer";
+import { fork, type ChildProcess } from "node:child_process";
 import { constants } from "node:fs";
 import { link, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { EvidenceConflictError, EvidenceStore } from "./artifacts.js";
 import { canonicalJson, hashValue } from "./canonical.js";
 import { validateGenesisConfig } from "./config.js";
@@ -12,7 +14,11 @@ import {
   withAnchoredParentDirectory,
   type AnchoredDirectory,
 } from "./event-stream.js";
-import { runGenesis, type GenesisRunOptions } from "./genesis.js";
+import {
+  GenesisRunPausedError,
+  runGenesis,
+  type GenesisRunOptions,
+} from "./genesis.js";
 import {
   createRunManifest,
   LAB_ENGINE_VERSION,
@@ -40,6 +46,7 @@ export interface PopulationRunOptions {
   runsRoot: string;
   universes: number;
   parallel?: number;
+  signal?: AbortSignal;
   /**
    * Test/integration seam; production callers use the manifest-bound Genesis
    * runner. It is not an identity input. Injected output is verified against
@@ -62,6 +69,17 @@ export class PopulationRunError extends Error {
     super(`Population failed for ${ordered.map((failure) => failure.universeId).join(", ")}`);
     this.name = "PopulationRunError";
     this.failures = ordered;
+  }
+}
+
+export class PopulationRunPausedError extends Error {
+  readonly universeIds: readonly string[];
+
+  constructor(universeIds: readonly string[]) {
+    const ordered = [...universeIds].sort(compareIds);
+    super(`Population paused with durable or pending universes: ${ordered.join(", ")}`);
+    this.name = "PopulationRunPausedError";
+    this.universeIds = ordered;
   }
 }
 
@@ -89,11 +107,13 @@ export async function runPopulation(options: PopulationRunOptions): Promise<Popu
   );
   const summaries: Array<RunSummary | undefined> = new Array(options.universes);
   const failures: PopulationFailure[] = [];
-  const execute = options.runUniverse ?? runGenesis;
+  const execute = options.runUniverse;
+  const paused = new Set<string>();
   let nextIndex = 0;
 
   const worker = async (): Promise<void> => {
     while (true) {
+      if (options.signal?.aborted) return;
       const index = nextIndex;
       nextIndex += 1;
       if (index >= universeIds.length) return;
@@ -102,11 +122,15 @@ export async function runPopulation(options: PopulationRunOptions): Promise<Popu
       config.seed = populationSeed(baseSeed, id);
       const expectedManifest = createRunManifest(config, id);
       try {
-        const summary = await execute({
+        const runOptions: GenesisRunOptions = {
           config: structuredClone(config),
           runsRoot: options.runsRoot,
           universeId: id,
-        });
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+        };
+        const summary = execute === undefined
+          ? await runGenesisProcess(runOptions)
+          : await execute(runOptions);
         assertSummaryIdentity(summary, expectedManifest.runId, id, config);
         if (options.runUniverse !== undefined) {
           await assertInjectedSummaryEvidence(
@@ -118,6 +142,10 @@ export async function runPopulation(options: PopulationRunOptions): Promise<Popu
         }
         summaries[index] = structuredClone(summary);
       } catch (cause) {
+        if (cause instanceof GenesisRunPausedError) {
+          paused.add(id);
+          return;
+        }
         // Evidence is append-only and intentionally left in place for diagnosis.
         failures.push({ universeId: id, cause });
       }
@@ -125,6 +153,11 @@ export async function runPopulation(options: PopulationRunOptions): Promise<Popu
   };
 
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  if (paused.size > 0 || options.signal?.aborted) {
+    throw new PopulationRunPausedError(
+      universeIds.filter((_, index) => summaries[index] === undefined),
+    );
+  }
   if (failures.length > 0) throw new PopulationRunError(failures);
 
   const complete = summaries.map((summary, index) => {
@@ -140,6 +173,130 @@ export async function runPopulation(options: PopulationRunOptions): Promise<Popu
   };
   await writePopulationSummary(options.runsRoot, populationIdValue, population);
   return structuredClone(population);
+}
+
+type ProcessOutcome =
+  | { type: "summary"; summary: RunSummary }
+  | { type: "paused"; runId: string; universeId: string; tick: number }
+  | { type: "error"; name: string; message: string };
+
+async function runGenesisProcess(options: GenesisRunOptions): Promise<RunSummary> {
+  const workerPath = fileURLToPath(new URL("./population-worker.js", import.meta.url));
+  const child = fork(workerPath, [], {
+    stdio: ["ignore", "ignore", "inherit", "ipc"],
+  });
+  return await awaitProcessOutcome(child, options);
+}
+
+function awaitProcessOutcome(child: ChildProcess, options: GenesisRunOptions): Promise<RunSummary> {
+  return new Promise((resolveOutcome, rejectOutcome) => {
+    let outcome: ProcessOutcome | undefined;
+    let settled = false;
+    const cleanup = (): void => options.signal?.removeEventListener("abort", onAbort);
+    const onAbort = (): void => {
+      if (child.connected) child.send({ type: "cancel" });
+    };
+    const fail = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (!child.killed) child.kill();
+      rejectOutcome(error);
+    };
+
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    child.once("error", fail);
+    child.on("message", (message: unknown) => {
+      try {
+        outcome = parseProcessOutcome(message, options.universeId);
+      } catch (error) {
+        outcome = {
+          type: "error",
+          name: "WorkerProtocolError",
+          message: error instanceof Error ? error.message : "Invalid worker response",
+        };
+      }
+    });
+    child.once("spawn", () => {
+      child.send({
+        type: "run",
+        options: {
+          config: structuredClone(options.config),
+          runsRoot: options.runsRoot,
+          universeId: options.universeId,
+        },
+      }, (error) => {
+        if (error) fail(error);
+        else if (options.signal?.aborted && child.connected) child.send({ type: "cancel" });
+      });
+    });
+    child.once("exit", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (outcome?.type === "summary" && code === 0) {
+        resolveOutcome(structuredClone(outcome.summary));
+        return;
+      }
+      if (outcome?.type === "paused") {
+        rejectOutcome(new GenesisRunPausedError(outcome.runId, outcome.universeId, outcome.tick));
+        return;
+      }
+      if (outcome?.type === "error") {
+        const error = new Error(outcome.message);
+        error.name = outcome.name;
+        rejectOutcome(error);
+        return;
+      }
+      if (options.signal?.aborted) {
+        rejectOutcome(new GenesisRunPausedError("unknown", options.universeId, 0));
+        return;
+      }
+      rejectOutcome(new Error(
+        `Population worker ${options.universeId} exited without a result (code=${String(code)}, signal=${String(signal)})`,
+      ));
+    });
+  });
+}
+
+function parseProcessOutcome(message: unknown, expectedUniverseId: string): ProcessOutcome {
+  if (message === null || typeof message !== "object") throw new Error("Worker response must be an object");
+  const candidate = message as Record<string, unknown>;
+  if (candidate.type === "summary") {
+    if (candidate.summary === null || typeof candidate.summary !== "object") {
+      throw new Error("Worker summary response is malformed");
+    }
+    const summary = candidate.summary as RunSummary;
+    if (summary.universeId !== expectedUniverseId) throw new Error("Worker returned another universe");
+    return { type: "summary", summary: structuredClone(summary) };
+  }
+  if (candidate.type === "paused") {
+    if (
+      candidate.universeId !== expectedUniverseId
+      || typeof candidate.runId !== "string"
+      || !Number.isSafeInteger(candidate.tick)
+      || (candidate.tick as number) < 0
+    ) {
+      throw new Error("Worker pause response is malformed");
+    }
+    return {
+      type: "paused",
+      runId: candidate.runId,
+      universeId: candidate.universeId,
+      tick: candidate.tick as number,
+    };
+  }
+  if (candidate.type === "error") {
+    if (typeof candidate.name !== "string" || typeof candidate.message !== "string") {
+      throw new Error("Worker error response is malformed");
+    }
+    return {
+      type: "error",
+      name: candidate.name.slice(0, 128),
+      message: candidate.message.slice(0, 1_024),
+    };
+  }
+  throw new Error("Unknown worker response type");
 }
 
 export function universeId(ordinal: number): string {

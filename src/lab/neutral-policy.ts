@@ -1,11 +1,21 @@
 import type { JsonObject, JsonValue } from "../core/types.js";
 import { compareCodeUnits } from "./canonical.js";
 import { LAB_POLICY_ID } from "./manifest.js";
-import { PPM, type LabAgentState, type Observation, type TaskObservation, type WorldAction } from "./types.js";
+import {
+  PPM,
+  type DeterministicRngCheckpoint,
+  type LabAgentState,
+  type NeutralPolicyCheckpoint,
+  type Observation,
+  type TaskObservation,
+  type WorldAction,
+} from "./types.js";
 
 export interface NeutralPolicyRandomSource {
   nextInt(maxExclusive: number): number;
   fork(label: string | number): NeutralPolicyRandomSource;
+  checkpoint?(): DeterministicRngCheckpoint;
+  restore?(checkpoint: DeterministicRngCheckpoint): void;
 }
 
 export interface NeutralPolicyOptions {
@@ -72,6 +82,42 @@ export class NeutralPolicy {
 
   static resultMemoryKey(taskId: string): string {
     return `task-result:${taskId}`;
+  }
+
+  checkpoint(): NeutralPolicyCheckpoint {
+    const streams = [...this.#streams.entries()]
+      .sort(([left], [right]) => compareCodeUnits(left, right))
+      .map(([agentId, stream]) => {
+        if (stream.checkpoint === undefined) {
+          throw new Error(`Policy RNG stream ${agentId} is not checkpointable`);
+        }
+        return { agentId, rng: stream.checkpoint() };
+      });
+    return {
+      policyId: this.id,
+      explorationPpm: this.#explorationPpm,
+      streams,
+    };
+  }
+
+  restore(checkpoint: NeutralPolicyCheckpoint, root: NeutralPolicyRandomSource): void {
+    if (checkpoint.policyId !== this.id || checkpoint.explorationPpm !== this.#explorationPpm) {
+      throw new Error("Neutral policy checkpoint configuration mismatch");
+    }
+    const restored = new Map<string, NeutralPolicyRandomSource>();
+    for (const entry of checkpoint.streams) {
+      if (typeof entry.agentId !== "string" || entry.agentId.length === 0 || restored.has(entry.agentId)) {
+        throw new Error("Neutral policy checkpoint has an invalid or duplicate agent stream");
+      }
+      const stream = root.fork(`neutral-policy/agent/${entry.agentId}`);
+      if (stream.restore === undefined) {
+        throw new Error(`Policy RNG stream ${entry.agentId} is not restorable`);
+      }
+      stream.restore(entry.rng);
+      restored.set(entry.agentId, stream);
+    }
+    this.#streams.clear();
+    for (const [agentId, stream] of restored) this.#streams.set(agentId, stream);
   }
 
   #stream(agentId: string, root: NeutralPolicyRandomSource): NeutralPolicyRandomSource {

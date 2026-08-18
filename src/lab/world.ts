@@ -48,6 +48,8 @@ export interface LogicalUniverseOptions {
   policy?: LogicalPolicy;
   onMetrics?: (snapshot: MetricsSnapshot) => void | Promise<void>;
   onCheckpoint?: (checkpoint: Checkpoint) => void | Promise<void>;
+  /** A replay-verified durable boundary from this exact recorder and manifest. */
+  resumeFrom?: Checkpoint;
 }
 
 const UNSUPPORTED_ACTIONS = new Set<PrimitiveActionType>([
@@ -77,6 +79,7 @@ export class LogicalUniverse {
   #nextTick = 1;
   #initialized = false;
   #tickRunning = false;
+  #lastCheckpointTick: number | undefined;
   #observations: Observation[] = [];
 
   constructor(
@@ -133,6 +136,7 @@ export class LogicalUniverse {
     this.#resolutionRng = rootRng.fork("resolution");
     this.#world = initialWorldState(manifest);
     this.#initialAgentTotals = multiplyResources(config.initialResources, config.agents);
+    if (options.resumeFrom !== undefined) this.#restore(options.resumeFrom);
   }
 
   static create(
@@ -157,9 +161,13 @@ export class LogicalUniverse {
     return this.state();
   }
 
-  async run(): Promise<WorldState> {
+  async run(signal?: AbortSignal): Promise<WorldState> {
     await this.#ensureInitialized();
-    while (this.#nextTick <= this.config.ticks) await this.#advanceTick();
+    if (signal?.aborted) return this.#pauseAtBoundary();
+    while (this.#nextTick <= this.config.ticks) {
+      await this.#advanceTick();
+      if (signal?.aborted) return this.#pauseAtBoundary();
+    }
     if (!this.#world.completed) {
       await this.#commit({
         tick: this.config.ticks,
@@ -167,9 +175,23 @@ export class LogicalUniverse {
         type: "run.completed",
         data: { ticks: this.config.ticks, events: this.recorder.lastSeq + 1 },
       });
-      await this.#onCheckpoint?.(this.#checkpoint(this.config.ticks));
+      await this.#emitCheckpoint(this.config.ticks);
     }
     return this.state();
+  }
+
+  async #pauseAtBoundary(): Promise<WorldState> {
+    if (this.#onCheckpoint === undefined) {
+      throw new Error("Cannot pause a logical universe without a durable checkpoint sink");
+    }
+    await this.#emitCheckpoint(this.#world.tick);
+    return this.state();
+  }
+
+  async #emitCheckpoint(tick: number): Promise<void> {
+    if (this.#onCheckpoint === undefined || this.#lastCheckpointTick === tick) return;
+    await this.#onCheckpoint(this.#checkpoint(tick));
+    this.#lastCheckpointTick = tick;
   }
 
   async tick(): Promise<WorldState> {
@@ -200,6 +222,45 @@ export class LogicalUniverse {
       });
     }
     this.#initialTotal = totalResources(this.#world);
+    this.#initialized = true;
+  }
+
+  #restore(checkpoint: Checkpoint): void {
+    if (checkpoint.runtime === undefined || checkpoint.runtimeHash === undefined) {
+      throw new Error("Legacy checkpoint has no resumable runtime state");
+    }
+    if (hashValue(checkpoint.runtime) !== checkpoint.runtimeHash) {
+      throw new Error("Checkpoint runtime hash mismatch");
+    }
+    if (
+      checkpoint.runId !== this.manifest.runId
+      || checkpoint.universeId !== this.manifest.universeId
+      || checkpoint.state.runId !== this.manifest.runId
+      || checkpoint.state.universeId !== this.manifest.universeId
+      || checkpoint.state.configHash !== this.manifest.configHash
+    ) {
+      throw new Error("Checkpoint belongs to another logical universe");
+    }
+    if (
+      checkpoint.tick !== checkpoint.state.tick
+      || checkpoint.seq !== this.recorder.lastSeq
+      || checkpoint.eventHash !== this.recorder.lastHash
+      || hashValue(checkpoint.state) !== checkpoint.stateHash
+    ) {
+      throw new Error("Checkpoint does not match the durable event boundary");
+    }
+    if (!checkpoint.state.started || checkpoint.state.completed || checkpoint.tick > this.config.ticks) {
+      throw new Error("Checkpoint is not an incomplete resumable world boundary");
+    }
+    if (!(this.#policy instanceof NeutralPolicy) || checkpoint.runtime.policy === null) {
+      throw new Error("The selected logical policy does not support deterministic resume");
+    }
+    this.#taskStream.restore(checkpoint.runtime.taskStream);
+    this.#policy.restore(checkpoint.runtime.policy, this.#policyRng);
+    this.#world = structuredClone(checkpoint.state);
+    this.#nextTick = checkpoint.tick + 1;
+    this.#initialTotal = totalResources(this.#world);
+    this.#lastCheckpointTick = checkpoint.tick;
     this.#initialized = true;
   }
 
@@ -241,7 +302,7 @@ export class LogicalUniverse {
       this.#assertConserved();
 
       const checkpoint = tick % this.config.checkpointEvery === 0 && tick !== this.config.ticks;
-      if (checkpoint && this.#onCheckpoint) await this.#onCheckpoint(this.#checkpoint(tick));
+      if (checkpoint) await this.#emitCheckpoint(tick);
     } finally {
       this.#tickRunning = false;
     }
@@ -756,6 +817,10 @@ export class LogicalUniverse {
 
   #checkpoint(tick: number): Checkpoint {
     const state = this.state();
+    const runtime = {
+      taskStream: this.#taskStream.checkpoint(),
+      policy: this.#policy instanceof NeutralPolicy ? this.#policy.checkpoint() : null,
+    };
     return {
       schemaVersion: LAB_SCHEMA_VERSION,
       runId: this.manifest.runId,
@@ -765,6 +830,8 @@ export class LogicalUniverse {
       eventHash: this.recorder.lastHash,
       stateHash: hashValue(state),
       state,
+      runtime,
+      runtimeHash: hashValue(runtime),
     };
   }
 }
