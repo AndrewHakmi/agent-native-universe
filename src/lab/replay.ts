@@ -9,7 +9,13 @@ import {
 import { assertLabManifestImplementation } from "./manifest.js";
 import { LabProtocolVerifier } from "./protocol-verifier.js";
 import { applyWorldEventMutable, initialWorldState } from "./reducer.js";
-import type { GenesisConfig, LabEvent, RunManifest, WorldState } from "./types.js";
+import type {
+  CheckpointRuntimeState,
+  GenesisConfig,
+  LabEvent,
+  RunManifest,
+  WorldState,
+} from "./types.js";
 
 export interface ReplayResult {
   state: WorldState;
@@ -19,6 +25,8 @@ export interface ReplayResult {
   eventsApplied: number;
   lastSeq: number;
   lastTick: number;
+  /** Present only when the projection covers the verified end of the stream. */
+  runtime?: CheckpointRuntimeState;
 }
 
 /** Replay verifies the complete deterministic protocol before returning its projection. */
@@ -64,6 +72,7 @@ export class ReplayEngine {
       eventsApplied,
       lastSeq,
       lastTick: projected.tick,
+      ...(untilTick === undefined ? { runtime: protocol.checkpointRuntime() } : {}),
     };
   }
 
@@ -74,6 +83,15 @@ export class ReplayEngine {
     untilTick?: number,
   ): Promise<ReplayResult> {
     return replayEventStream(iterateEventFile(path), manifest, config, untilTick);
+  }
+
+  /** Verify a complete run or an incomplete stream ending exactly at a durable tick boundary. */
+  static async replayRecoverableFile(
+    path: string,
+    manifest: RunManifest,
+    config: GenesisConfig,
+  ): Promise<ReplayResult> {
+    return replayEventStream(iterateEventFile(path), manifest, config, undefined, true);
   }
 
   /** Replay from an fd-held evidence snapshot without resolving the pathname again. */
@@ -92,6 +110,7 @@ async function replayEventStream(
   manifest: RunManifest,
   config: GenesisConfig,
   untilTick?: number,
+  allowIncompleteBoundary = false,
 ): Promise<ReplayResult> {
   assertLabManifestImplementation(manifest);
   validateUntilTick(untilTick);
@@ -116,7 +135,7 @@ async function replayEventStream(
       lastSeq = event.seq;
     }
   }
-  protocol.finish();
+  protocol.finish({ allowIncompleteBoundary });
 
   const projected = outputState ?? state;
   const digest = hashValue(projected);
@@ -128,6 +147,7 @@ async function replayEventStream(
     eventsApplied,
     lastSeq,
     lastTick: projected.tick,
+    ...(untilTick === undefined ? { runtime: protocol.checkpointRuntime() } : {}),
   };
 }
 

@@ -111,8 +111,12 @@ previous hash, and SHA-256 event hash. Writes are serialized through one
 recorder. The Genesis run path disables the recorder's in-memory event copy, and
 file replay reads one record at a time while verifying the complete hash chain.
 Genesis completion additionally compares replayed and live state hashes.
-Immutable artifacts refuse conflicting replacement, and incomplete evidence is
-preserved for diagnosis rather than silently resumed or deleted.
+Immutable artifacts refuse conflicting replacement. An incomplete stream is
+resumed only when it ends at a verified `tick.completed` boundary and its latest
+checkpoint matches independently replayed world state, event-chain tail, task
+generator state, and per-agent neutral-policy RNG streams. Mid-tick evidence,
+legacy checkpoints without runtime state, and mismatches remain preserved for
+diagnosis and fail closed instead of being truncated or rewritten.
 
 Authoritative replay requires the stored `config.json`; the config hash, seed,
 experiment, deterministic run ID, and manifest implementation identity must all
@@ -140,6 +144,12 @@ historical engine.
 Checkpoints still serialize the complete projected world state. Frequent
 checkpoints can therefore amplify disk use even though event recording and
 replay no longer materialize the complete event log in memory.
+SIGINT or SIGTERM requests a boundary pause: the active tick completes, a
+durable checkpoint is flushed, and the writer lease is released. Re-running
+the same deterministic command automatically resumes that run; a completed run
+remains idempotent. Production population universes execute in separate Node.js
+processes bounded by `--parallel`, while result ordering and scientific hashes
+remain independent of process scheduling.
 Manifest, config, summary, attestation, and metrics reads are bounded; an
 individual checkpoint above 64 MiB is rejected instead of being materialized
 into process memory. The reference configuration remains below that per-file
@@ -235,8 +245,9 @@ node dist/lab/runner.js serve --data-dir ./runs --host 0.0.0.0 --port 3000 \
 The same surface is available as `anu lab ...`. With no `--config`, the runner
 uses a conservative 16-agent, 500-tick configuration suitable for a smoke run.
 Under the Compose 2 GB memory ceiling, population parallelism 2 is a starting
-engineering estimate pending a live full-population benchmark; it is not a
-validated capacity guarantee.
+engineering estimate pending a concurrent process-worker benchmark. One
+parallelism-1 reference universe has completed; this is not a multi-universe
+capacity guarantee.
 
 The policy scheduler now creates one immutable, redacted per-tick observation
 snapshot. Structural sharing stays internal, while policy code receives an
@@ -250,8 +261,9 @@ the derived ratio. This microbenchmark excludes reducer work, event I/O,
 checkpoints, replay, and process scheduling; it is not full-capacity proof. See
 `docs/LAB_CAPACITY.md` for the method and remaining bottlenecks.
 
-The observer exposes only read methods: health, readiness, the run catalogue,
-run summaries/final attestations, and paginated events. Run detail labels the
+The observer exposes only read methods: its dependency-free human UI, health,
+readiness, the run catalogue, run summaries/final attestations, bounded metric
+history, and paginated events. Run detail labels the
 optional attestation as `missing`, `invalid`, or `self_consistent`; only the CLI
 with an external expected commitment performs authoritative semantic
 verification. Event pagination remains
@@ -268,10 +280,12 @@ duplicate run IDs return 409 instead of choosing one directory.
 When `--auth-token-file` is omitted, the API is suitable only for the isolated
 internal control network. When it is present, the Observer reads the strong
 token once at startup and requires an exact Bearer header on catalogue, detail,
-and event routes using a timing-safe comparison. Liveness and readiness remain
-unauthenticated for container probes. The edge Compose profile requires this
-application check and retains an independent Traefik authentication middleware
-to prevent shared-network routing bypasses.
+metric, and event routes using a timing-safe comparison. The UI keeps a token
+entered by its operator in memory only. UI assets, the service contract,
+liveness, and readiness remain unauthenticated so the shell and container
+probes can load. The edge Compose profile requires this application check and
+retains an independent Traefik authentication middleware to prevent
+shared-network routing bypasses.
 
 Observer pagination performs bounded parsing, redaction, and local sequence
 checks; it deliberately does not verify the complete hash prefix for each HTTP
@@ -303,14 +317,15 @@ Several experiments remain intentionally separate:
 
 Current operational limits are equally important:
 
-- the full 32-universe population at 64 agents × 10,000 ticks has not yet been
-  completed as a live resource benchmark;
+- one 64-agent × 10,000-tick reference universe has completed with full replay
+  and attestation, but the 32-universe population has not; see the measured
+  envelope in `docs/LAB_CAPACITY.md`;
 - Observer cursor checkpoints are process-local and are rebuilt after restart;
 - inbox entries have no consume or acknowledgement lifecycle;
 - the capability DSL is restricted to logical mode;
 - complete-state checkpoints can dominate disk use at short intervals;
-- the Observer UI is still pending, and application token rotation requires an
-  edge-container recreate because the secret is deliberately read only once.
+- application token rotation requires an edge-container recreate because the
+  secret is deliberately read only once.
 
 Consequently, a successful run proves reproducible execution and measurement;
 it does not by itself prove emergence. Claims of specialization or organization

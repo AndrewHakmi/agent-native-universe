@@ -960,6 +960,12 @@ function validateCheckpoint(checkpoint: Checkpoint, manifest: RunManifest): void
   }
   if (checkpoint.state.tick !== checkpoint.tick) throw new Error("Checkpoint state tick mismatch");
   if (hashValue(checkpoint.state) !== checkpoint.stateHash) throw new Error("Checkpoint state hash mismatch");
+  if ((checkpoint.runtime === undefined) !== (checkpoint.runtimeHash === undefined)) {
+    throw new Error("Checkpoint runtime and runtimeHash must appear together");
+  }
+  if (checkpoint.runtime !== undefined && hashValue(checkpoint.runtime) !== checkpoint.runtimeHash) {
+    throw new Error("Checkpoint runtime hash mismatch");
+  }
 }
 
 function validateMetric(metric: MetricsSnapshot): void {

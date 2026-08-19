@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { canonicalJson } from "../dist/lab/canonical.js";
+import { canonicalJson, hashValue } from "../dist/lab/canonical.js";
 import { DEFAULT_GENESIS_CONFIG } from "../dist/lab/config.js";
-import { runGenesis } from "../dist/lab/genesis.js";
-import { populationSeed } from "../dist/lab/manifest.js";
+import { GenesisRunPausedError, runGenesis } from "../dist/lab/genesis.js";
+import { createRunManifest, populationSeed } from "../dist/lab/manifest.js";
 import {
   createPopulationId,
   MAX_POPULATION_PARALLELISM,
@@ -79,6 +79,92 @@ test("Genesis persists metrics and checkpoints, then proves final replay equival
     await readFile(join(directory, "events.jsonl"), "utf8"),
     eventEvidence,
     "recovery must not append a second genesis",
+  );
+});
+
+test("a durable tick boundary resumes to the exact uninterrupted scientific result", async (t) => {
+  const root = await temporaryRoot(t);
+  const pausedRoot = join(root, "paused");
+  const uninterruptedRoot = join(root, "uninterrupted");
+  const config = testConfig("durable-resume-equivalence");
+  const manifest = createRunManifest(config, "U0001");
+  const controller = new AbortController();
+  controller.abort();
+
+  await assert.rejects(
+    runGenesis({
+      config,
+      runsRoot: pausedRoot,
+      universeId: "U0001",
+      signal: controller.signal,
+    }),
+    (error) => {
+      assert.ok(error instanceof GenesisRunPausedError);
+      assert.equal(error.tick, 0);
+      assert.equal(error.runId, manifest.runId);
+      return true;
+    },
+  );
+
+  const pausedDirectory = join(
+    pausedRoot,
+    config.experimentId,
+    "U0001",
+    manifest.runId,
+  );
+  const checkpoint = JSON.parse(await readFile(
+    join(pausedDirectory, "checkpoints", "0.json"),
+    "utf8",
+  ));
+  assert.equal(checkpoint.tick, 0);
+  assert.equal(checkpoint.runtimeHash, hashValue(checkpoint.runtime));
+
+  const resumed = await runGenesis({ config, runsRoot: pausedRoot, universeId: "U0001" });
+  const uninterrupted = await runGenesis({
+    config,
+    runsRoot: uninterruptedRoot,
+    universeId: "U0001",
+  });
+  assert.deepEqual(resumed, uninterrupted);
+  assert.equal(
+    await readFile(join(pausedDirectory, "events.jsonl"), "utf8"),
+    await readFile(join(
+      uninterruptedRoot,
+      config.experimentId,
+      "U0001",
+      manifest.runId,
+      "events.jsonl",
+    ), "utf8"),
+  );
+});
+
+test("resume rejects recomputed but replay-inconsistent checkpoint runtime state", async (t) => {
+  const runsRoot = await temporaryRoot(t);
+  const config = testConfig("durable-resume-runtime-tamper");
+  const manifest = createRunManifest(config, "U0001");
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    runGenesis({ config, runsRoot, universeId: "U0001", signal: controller.signal }),
+    GenesisRunPausedError,
+  );
+
+  const checkpointPath = join(
+    runsRoot,
+    config.experimentId,
+    "U0001",
+    manifest.runId,
+    "checkpoints",
+    "0.json",
+  );
+  const checkpoint = JSON.parse(await readFile(checkpointPath, "utf8"));
+  checkpoint.runtime.taskStream.sequence += 1;
+  checkpoint.runtimeHash = hashValue(checkpoint.runtime);
+  await writeFile(checkpointPath, canonicalJson(checkpoint), "utf8");
+
+  await assert.rejects(
+    runGenesis({ config, runsRoot, universeId: "U0001" }),
+    /checkpoint does not match the verified event boundary/,
   );
 });
 

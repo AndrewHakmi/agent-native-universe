@@ -1,5 +1,10 @@
 # Agent Native Universe
 
+[![CI](https://github.com/AndrewHakmi/agent-native-universe/actions/workflows/ci.yml/badge.svg)](https://github.com/AndrewHakmi/agent-native-universe/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/AndrewHakmi/agent-native-universe)](https://github.com/AndrewHakmi/agent-native-universe/releases)
+[![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22-5FA04E)](https://nodejs.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-87f5bd.svg)](LICENSE)
+
 **An agent-native runtime where autonomous NanoAgents discover one another, negotiate stateful relationships, think through interchangeable LLM providers, pay for their own resource use, reach distributed agreement, and recursively organize into MetaAgents.**
 
 The project is built around two primitives:
@@ -141,6 +146,24 @@ npm run demo:living
 
 The repository has zero runtime npm dependencies.
 
+Stable releases include an npm-compatible archive and a hardened Linux/amd64
+Universe Lab image:
+
+```bash
+docker pull ghcr.io/andrewhakmi/agent-native-universe-lab:v1.0.0
+```
+
+Start a local read-only Observer after producing evidence:
+
+```bash
+node dist/lab/runner.js genesis-1 --data-dir ./runs --agents 16 --ticks 500
+node dist/lab/runner.js serve --data-dir ./runs --host 127.0.0.1 --port 8787
+```
+
+Open http://127.0.0.1:8787/. The v1 Observer includes a searchable evidence
+catalogue, outcome and structural metrics, deterministic attestation status, and
+a bounded redacted event window. See [ANU Observer](docs/OBSERVER.md).
+
 ## Universe Lab and Genesis-1
 
 The repository now includes a deterministic, event-sourced laboratory for
@@ -179,6 +202,8 @@ yet evidence that the full reference population runs within production limits.
 The internal Observer remains unauthenticated on its isolated control network.
 The opt-in edge role loads a strong Bearer token from a Docker-mounted file and
 enforces it inside the application as well as retaining Traefik authentication.
+The human UI keeps a directly entered Bearer token in memory only; it never
+stores the token in browser persistence.
 
 Run a conservative local experiment and verify it by replay:
 
@@ -212,7 +237,7 @@ See [Universe Lab](docs/UNIVERSE_LAB.md) for the scientific boundary, evidence
 model, commands, and current logical-v1.1 limitations. See
 [Lab deployment](docs/LAB_DEPLOYMENT.md) for the hardened Docker/Traefik stand.
 See [Lab capacity](docs/LAB_CAPACITY.md) for the runnable current-checkout
-profile, explicitly historical baseline comparison, storage estimate, and
+profile, completed single-reference-universe canary, storage measurements, and
 remaining steps before the full population can be considered validated.
 
 ## Imports
@@ -278,7 +303,18 @@ docs/           architecture and operating semantics
 - [Multi-machine operation](docs/MULTI_MACHINE.md)
 - [Network BFT](docs/NETWORK_BFT.md)
 - [Autonomous encrypted mesh](docs/AUTONOMOUS_MESH.md)
+- [ANU Observer](docs/OBSERVER.md)
+- [Security policy](SECURITY.md)
+- [Changelog](CHANGELOG.md)
 
 ## Status
 
-This is a research-grade executable substrate. It now includes real encrypted networking, persistent recovery, distributed voting, durable resource settlement, metered cognition and continuous fractal organization. It is not yet a formally verified or independently audited production security boundary.
+Version 1.0.0 is the first stable API and operating release. It includes real
+encrypted networking, persistent recovery, distributed voting, durable resource
+settlement, metered cognition, continuous fractal organization, deterministic
+Universe Lab evidence, and a production-oriented read-only Observer.
+
+“Stable release” describes the documented interfaces and verified invariants; it
+does not claim formal verification, an independent security audit, or completion
+of the full 32 × 64 × 10,000 capacity target. Those boundaries remain explicit
+in [Lab capacity](docs/LAB_CAPACITY.md) and [Security policy](SECURITY.md).

@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { createInterface } from "node:readline";
+import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -25,6 +26,15 @@ function parseSingleJson(text) {
 }
 
 test("anu lab delegates to the strict structured runner without changing existing commands", () => {
+  for (const flag of ["--version", "-v", "version"]) {
+    const version = invoke("dist/cli/index.js", [flag]);
+    assert.equal(version.status, 0, version.stderr);
+    assert.equal(version.stdout, "1.0.0\n");
+  }
+  const rootHelp = invoke("dist/cli/index.js", ["--help"]);
+  assert.equal(rootHelp.status, 0, rootHelp.stderr);
+  assert.match(rootHelp.stdout, /\bv1\.0\.0\b/);
+
   const help = invoke("dist/cli/index.js", ["lab", "--help"]);
   assert.equal(help.status, 0, help.stderr);
   assert.equal(parseSingleJson(help.stdout).status, "ok");
@@ -177,6 +187,83 @@ test("run aliases population, conserves finite resources and produces replayable
   assert.equal(impossiblePopulation.status, 2);
   assert.match(parseSingleJson(impossiblePopulation.stderr).error.message, /finite credits budget/);
 });
+
+test("population SIGTERM pauses a child at a durable boundary and the same command resumes", async (t) => {
+  const evidenceRoot = await mkdtemp(join(tmpdir(), "anu-lab-cli-resume-"));
+  t.after(() => rm(evidenceRoot, { recursive: true, force: true }));
+  const args = [
+    "dist/lab/runner.js",
+    "population",
+    "--data-dir",
+    evidenceRoot,
+    "--universes",
+    "1",
+    "--parallel",
+    "1",
+    "--agents",
+    "8",
+    "--ticks",
+    "200",
+    "--metric-every",
+    "20",
+    "--checkpoint-every",
+    "20",
+    "--seed",
+    "cli-durable-resume",
+  ];
+  const child = spawn(process.execPath, args, {
+    cwd: repositoryRoot,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+      await once(child, "exit");
+    }
+  });
+  assert.ok(child.stdout);
+  assert.ok(child.stderr);
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+
+  await waitForWriterLease(evidenceRoot);
+  assert.equal(child.kill("SIGTERM"), true);
+  const [code, signal] = await once(child, "exit");
+  assert.equal(code, 0, stderr);
+  assert.equal(signal, null);
+  const paused = parseSingleJson(stdout);
+  assert.equal(paused.status, "paused");
+  assert.deepEqual(paused.universes, ["U0001"]);
+
+  const resumed = invoke(args[0], args.slice(1));
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.equal(parseSingleJson(resumed.stdout).status, "completed");
+});
+
+async function waitForWriterLease(evidenceRoot) {
+  const universeRoot = join(evidenceRoot, "genesis-1", "U0001");
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    try {
+      for (const runId of await readdir(universeRoot)) {
+        try {
+          await readFile(join(universeRoot, runId, ".runner.lock"), "utf8");
+          return;
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+        }
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    await delay(10);
+  }
+  throw new Error("population worker lease did not appear before timeout");
+}
 
 test("serve binds all interfaces by default and closes gracefully on SIGTERM", async (t) => {
   const fixtureRoot = await mkdtemp(join(tmpdir(), "anu-lab-cli-serve-"));

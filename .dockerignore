@@ -1,6 +1,7 @@
 .git
 .github
 .codebase-memory
+.superdesign
 node_modules
 dist
 dist-test

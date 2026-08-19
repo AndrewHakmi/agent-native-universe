@@ -1,0 +1,78 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  github-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Match tag to package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(node -p 'JSON.parse(require("node:fs").readFileSync("package.json", "utf8")).version')"
+          test "${GITHUB_REF_NAME}" = "v${package_version}"
+      - run: npm ci --ignore-scripts
+      - name: Verify release behavior and package contents
+        run: npm run release:verify
+      - name: Build production image
+        run: |
+          docker build \
+            --build-arg "ANU_VERSION=${GITHUB_REF_NAME#v}" \
+            --build-arg "VCS_REF=${GITHUB_SHA}" \
+            --file Dockerfile.lab \
+            --tag "anu-lab:${GITHUB_REF_NAME}" \
+            .
+      - name: Publish production image to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY,,}-lab"
+          printf '%s' "${GH_TOKEN}" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+          docker tag "anu-lab:${GITHUB_REF_NAME}" "${image}:${GITHUB_REF_NAME}"
+          docker tag "anu-lab:${GITHUB_REF_NAME}" "${image}:latest"
+          docker push "${image}:${GITHUB_REF_NAME}"
+          docker push "${image}:latest"
+      - name: Create npm-compatible archive
+        run: |
+          set -euo pipefail
+          mkdir -p release-artifacts
+          npm pack --pack-destination release-artifacts
+          package_version="$(node -p 'JSON.parse(require("node:fs").readFileSync("package.json", "utf8")).version')"
+          npm sbom --sbom-format cyclonedx > "release-artifacts/agent-native-universe-v${package_version}.sbom.cdx.json"
+          cd release-artifacts
+          sha256sum ./*.tgz ./*.json > SHA256SUMS
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" \
+              --verify-tag \
+              --title "Agent Native Universe ${GITHUB_REF_NAME}" \
+              --notes-file CHANGELOG.md
+          fi
+          gh release upload "${GITHUB_REF_NAME}" release-artifacts/* --clobber

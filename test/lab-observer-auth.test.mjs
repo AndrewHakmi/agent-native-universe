@@ -40,7 +40,12 @@ test("application Bearer auth protects evidence routes without breaking probes o
   assert.equal((await fetch(`${baseUrl}/readyz`)).status, 200);
   assert.equal((await fetch(`${baseUrl}/`)).status, 200);
 
-  for (const path of ["/api/runs", "/api/runs/missing", "/api/runs/missing/events"]) {
+  for (const path of [
+    "/api/runs",
+    "/api/runs/missing",
+    "/api/runs/missing/events",
+    "/api/runs/missing/metrics",
+  ]) {
     const response = await fetch(`${baseUrl}${path}`);
     assert.equal(response.status, 401);
     assert.equal(response.headers.get("www-authenticate"), 'Bearer realm="anu-lab-observer"');
@@ -63,7 +68,11 @@ test("application Bearer auth protects evidence routes without breaking probes o
   });
   assert.equal(authorized.status, 200);
   assert.deepEqual(await authorized.json(), { count: 0, runs: [], truncated: false });
-  for (const path of ["/api/runs/missing", "/api/runs/missing/events"]) {
+  for (const path of [
+    "/api/runs/missing",
+    "/api/runs/missing/events",
+    "/api/runs/missing/metrics",
+  ]) {
     const response = await fetch(`${baseUrl}${path}`, {
       headers: { Authorization: `Bearer ${AUTH_TOKEN}` },
     });

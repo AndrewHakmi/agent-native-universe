@@ -1,16 +1,46 @@
 name: ci
+
 on:
   push:
+    branches:
+      - master
+      - "agent/**"
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  runtime:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - run: npm install --ignore-scripts
-      - run: npm test
-      - run: npm run demo:living
+          cache: npm
+      - name: Install exact development dependencies
+        run: npm ci --ignore-scripts
+      - name: Execute the complete test universe
+        run: npm test
+      - name: Execute the living-graph smoke scenario
+        run: npm run demo:living
+      - name: Audit production dependency surface
+        run: npm audit --omit=dev --audit-level=moderate
+      - name: Verify the publishable package
+        run: npm pack --dry-run
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate the fail-closed Compose model
+        run: docker compose --env-file .env.example -f compose.lab.yml config --quiet
+      - name: Build the production Observer image
+        run: docker build --file Dockerfile.lab --tag anu-lab:ci .

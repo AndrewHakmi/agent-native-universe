@@ -7,6 +7,7 @@ import { createRunManifest } from "./manifest.js";
 import { ReplayEngine, type ReplayResult } from "./replay.js";
 import {
   LAB_SCHEMA_VERSION,
+  type Checkpoint,
   type GenesisConfig,
   type MetricsSnapshot,
   type RunManifest,
@@ -19,6 +20,21 @@ export interface GenesisRunOptions {
   config: GenesisConfig;
   runsRoot: string;
   universeId: string;
+  signal?: AbortSignal;
+}
+
+export class GenesisRunPausedError extends Error {
+  readonly runId: string;
+  readonly universeId: string;
+  readonly tick: number;
+
+  constructor(runId: string, universeId: string, tick: number) {
+    super(`Genesis run ${universeId} paused durably at tick ${tick}`);
+    this.name = "GenesisRunPausedError";
+    this.runId = runId;
+    this.universeId = universeId;
+    this.tick = tick;
+  }
 }
 
 /**
@@ -42,20 +58,19 @@ export async function runGenesis(options: GenesisRunOptions): Promise<RunSummary
 
   try {
     await evidence.initialize(manifest, config);
-    const existing = await recoverCompletedRun(evidence, manifest, config);
-    if (existing) return existing;
-    if (evidence.events.lastSeq !== 0) {
-      throw new EvidenceConflictError(
-        `Refusing to append a fresh run to incomplete evidence for ${manifest.universeId}`,
-      );
-    }
+    const recovery = await recoverExistingRun(evidence, manifest, config);
+    if (recovery.kind === "completed") return recovery.summary;
 
     const universe = new LogicalUniverse(manifest, config, evidence.events, {
       onMetrics: (metrics) => evidence.appendMetrics(metrics),
       onCheckpoint: (checkpoint) => evidence.writeCheckpoint(checkpoint),
+      ...(recovery.kind === "checkpoint" ? { resumeFrom: recovery.checkpoint } : {}),
     });
-    const liveState = await universe.run();
+    const liveState = await universe.run(options.signal);
     await evidence.flush();
+    if (!liveState.completed) {
+      throw new GenesisRunPausedError(manifest.runId, manifest.universeId, liveState.tick);
+    }
 
     const replay = await ReplayEngine.replayFile(evidence.eventsPath, manifest, config);
     assertReplayEquivalent(liveState, replay, config);
@@ -78,21 +93,35 @@ export async function runGenesis(options: GenesisRunOptions): Promise<RunSummary
   }
 }
 
-async function recoverCompletedRun(
+type ExistingRunRecovery =
+  | { kind: "fresh" }
+  | { kind: "checkpoint"; checkpoint: Checkpoint }
+  | { kind: "completed"; summary: RunSummary };
+
+async function recoverExistingRun(
   evidence: EvidenceStore,
   manifest: RunManifest,
   config: GenesisConfig,
-): Promise<RunSummary | undefined> {
+): Promise<ExistingRunRecovery> {
   const stored = await evidence.readSummary();
   if (evidence.events.lastSeq === 0) {
     if (stored) throw new EvidenceConflictError("A summary exists without an event stream");
-    return undefined;
+    return { kind: "fresh" };
   }
 
-  const replay = await ReplayEngine.replayFile(evidence.eventsPath, manifest, config);
+  const replay = await ReplayEngine.replayRecoverableFile(evidence.eventsPath, manifest, config);
   if (!replay.state.completed) {
     if (stored) throw new EvidenceConflictError("A summary exists for an incomplete event stream");
-    return undefined;
+    if (await evidence.readFinalAttestation()) {
+      throw new EvidenceConflictError("A final attestation exists for an incomplete event stream");
+    }
+    const checkpoint = (await evidence.readCheckpoints()).at(-1);
+    if (checkpoint === undefined) {
+      throw new EvidenceConflictError("Incomplete evidence has no durable checkpoint");
+    }
+    assertCheckpointReplayEquivalent(checkpoint, replay);
+    assertMetricsMatchReplay(await evidence.readMetrics(), replay.state.metrics);
+    return { kind: "checkpoint", checkpoint };
   }
   assertCompletedReplay(replay, config);
   const reconstructed = await createSummary(evidence, manifest, config, replay);
@@ -107,7 +136,24 @@ async function recoverCompletedRun(
     replay.state.metrics,
   ));
   await evidence.flush();
-  return structuredClone(stored ?? reconstructed);
+  return { kind: "completed", summary: structuredClone(stored ?? reconstructed) };
+}
+
+function assertCheckpointReplayEquivalent(checkpoint: Checkpoint, replay: ReplayResult): void {
+  if (checkpoint.runtime === undefined || checkpoint.runtimeHash === undefined || replay.runtime === undefined) {
+    throw new EvidenceConflictError("Latest checkpoint has no replay-verifiable runtime state");
+  }
+  if (
+    checkpoint.tick !== replay.lastTick
+    || checkpoint.seq !== replay.lastSeq
+    || checkpoint.eventHash !== replay.finalEventHash
+    || checkpoint.stateHash !== replay.stateHash
+    || hashValue(checkpoint.state) !== replay.stateHash
+    || hashValue(checkpoint.runtime) !== checkpoint.runtimeHash
+    || hashValue(checkpoint.runtime) !== hashValue(replay.runtime)
+  ) {
+    throw new EvidenceConflictError("Latest checkpoint does not match the verified event boundary");
+  }
 }
 
 async function createSummary(

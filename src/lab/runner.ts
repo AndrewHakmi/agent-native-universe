@@ -12,11 +12,12 @@ import {
   attestRunEvidence,
   verifyRunEvidenceAttestation,
 } from "./evidence-attestation.js";
-import { runGenesis } from "./genesis.js";
+import { GenesisRunPausedError, runGenesis } from "./genesis.js";
 import { startObserverServer } from "./observer.js";
 import {
   MAX_POPULATION_PARALLELISM,
   MAX_POPULATION_UNIVERSES,
+  PopulationRunPausedError,
   runPopulation,
 } from "./population.js";
 import { ReplayEngine } from "./replay.js";
@@ -225,13 +226,32 @@ async function executePopulation(
     1,
     MAX_POPULATION_PARALLELISM,
   );
-  const population = await runPopulation({ config, runsRoot, universes, parallel });
-  writeJson(io.stdout, {
-    command: invokedCommand,
-    mode: "population",
-    status: "completed",
-    population,
-  });
+  const shutdown = installRunAbortController();
+  try {
+    const population = await runPopulation({
+      config,
+      runsRoot,
+      universes,
+      parallel,
+      signal: shutdown.signal,
+    });
+    writeJson(io.stdout, {
+      command: invokedCommand,
+      mode: "population",
+      status: "completed",
+      population,
+    });
+  } catch (error) {
+    if (!(error instanceof PopulationRunPausedError)) throw error;
+    writeJson(io.stdout, {
+      command: invokedCommand,
+      mode: "population",
+      status: "paused",
+      universes: error.universeIds,
+    });
+  } finally {
+    shutdown.cleanup();
+  }
 }
 
 async function executeGenesis(argv: readonly string[], io: LabCliIo): Promise<void> {
@@ -248,12 +268,26 @@ async function executeGenesis(argv: readonly string[], io: LabCliIo): Promise<vo
   const config = await configuredGenesis(options.values);
   const runsRoot = optionPath(options.values, "data-dir", DEFAULT_DATA_DIR);
   const universeId = optionUniverseId(options.values, "universe-id", DEFAULT_UNIVERSE_ID);
-  const summary = await runGenesis({ config, runsRoot, universeId });
-  writeJson(io.stdout, {
-    command: "genesis-1",
-    status: "completed",
-    summary,
-  });
+  const shutdown = installRunAbortController();
+  try {
+    const summary = await runGenesis({ config, runsRoot, universeId, signal: shutdown.signal });
+    writeJson(io.stdout, {
+      command: "genesis-1",
+      status: "completed",
+      summary,
+    });
+  } catch (error) {
+    if (!(error instanceof GenesisRunPausedError)) throw error;
+    writeJson(io.stdout, {
+      command: "genesis-1",
+      status: "paused",
+      runId: error.runId,
+      universeId: error.universeId,
+      tick: error.tick,
+    });
+  } finally {
+    shutdown.cleanup();
+  }
 }
 
 async function executeReplay(argv: readonly string[], io: LabCliIo): Promise<void> {
@@ -628,6 +662,23 @@ function optionHost(host: string): string {
     throw new CliUsageError("--host must be a valid host name or IP address");
   }
   return host;
+}
+
+function installRunAbortController(): {
+  signal: AbortSignal;
+  cleanup(): void;
+} {
+  const controller = new AbortController();
+  const abort = (): void => controller.abort();
+  process.once("SIGINT", abort);
+  process.once("SIGTERM", abort);
+  return {
+    signal: controller.signal,
+    cleanup: () => {
+      process.off("SIGINT", abort);
+      process.off("SIGTERM", abort);
+    },
+  };
 }
 
 function installObserverShutdown(server: Server, io: LabCliIo): void {
