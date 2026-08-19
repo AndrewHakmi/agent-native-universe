@@ -23,8 +23,18 @@ RUN npm ci --omit=dev --ignore-scripts \
 
 FROM ${NODE_IMAGE} AS runtime
 
+ARG ANU_VERSION=development
+ARG VCS_REF=unknown
+
 ENV NODE_ENV=production
 WORKDIR /app
+
+LABEL org.opencontainers.image.title="Agent Native Universe Lab" \
+      org.opencontainers.image.description="Hardened read-only Observer and deterministic Universe Lab runner" \
+      org.opencontainers.image.source="https://github.com/AndrewHakmi/agent-native-universe" \
+      org.opencontainers.image.version="${ANU_VERSION}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.licenses="MIT"
 
 COPY --chown=node:node package.json package-lock.json ./
 COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_modules

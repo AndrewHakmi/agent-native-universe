@@ -3,7 +3,14 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
+import { Script } from "node:vm";
+import { canonicalJson } from "../dist/lab/canonical.js";
 import { startObserverServer } from "../dist/lab/observer.js";
+import {
+  OBSERVER_UI_CSS,
+  OBSERVER_UI_HTML,
+  OBSERVER_UI_JAVASCRIPT,
+} from "../dist/lab/observer-ui.js";
 
 async function writeJson(path, value) {
   await mkdir(dirname(path), { recursive: true });
@@ -37,6 +44,54 @@ async function startFixture(t, dataDir) {
   return `http://127.0.0.1:${address.port}`;
 }
 
+function cssToken(name) {
+  const match = OBSERVER_UI_CSS.match(new RegExp(`--${name}: (#[0-9a-f]{6});`, "i"));
+  assert.ok(match, `missing CSS token --${name}`);
+  return match[1];
+}
+
+function relativeLuminance(hex) {
+  const channels = [1, 3, 5].map((offset) => Number.parseInt(hex.slice(offset, offset + 2), 16) / 255);
+  const linear = channels.map((channel) => (
+    channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4
+  ));
+  return (0.2126 * linear[0]) + (0.7152 * linear[1]) + (0.0722 * linear[2]);
+}
+
+function contrastRatio(foreground, background) {
+  const foregroundLuminance = relativeLuminance(foreground);
+  const backgroundLuminance = relativeLuminance(background);
+  return (Math.max(foregroundLuminance, backgroundLuminance) + 0.05)
+    / (Math.min(foregroundLuminance, backgroundLuminance) + 0.05);
+}
+
+test("Observer UI is self-contained, accessible by structure, and syntactically valid", () => {
+  assert.doesNotThrow(() => new Script(OBSERVER_UI_JAVASCRIPT));
+  assert.doesNotMatch(OBSERVER_UI_HTML, /(?:src|href)="https?:\/\//);
+  assert.doesNotMatch(OBSERVER_UI_JAVASCRIPT, /localStorage|sessionStorage|innerHTML/);
+  assert.match(OBSERVER_UI_HTML, /<main\b/);
+  assert.match(OBSERVER_UI_HTML, /<aside\b/);
+  assert.match(OBSERVER_UI_HTML, /aria-live=/);
+  assert.match(OBSERVER_UI_HTML, /Accessible data table/);
+  assert.match(OBSERVER_UI_HTML, /class="breadcrumbs" role="navigation" aria-label="Evidence location"/);
+  assert.match(OBSERVER_UI_HTML, /class="legend" role="group" aria-label="Chart legend"/);
+  assert.match(OBSERVER_UI_CSS, /\[hidden\] \{ display: none !important; \}/);
+  assert.match(OBSERVER_UI_CSS, /prefers-reduced-motion/);
+});
+
+test("Observer text palette meets WCAG AA contrast on every base surface", () => {
+  const foregrounds = ["ink", "muted", "subtle", "green", "cyan", "violet", "amber", "danger"];
+  const backgrounds = ["canvas", "panel", "raised", "raised-2"];
+  for (const foreground of foregrounds) {
+    for (const background of backgrounds) {
+      assert.ok(
+        contrastRatio(cssToken(foreground), cssToken(background)) >= 4.5,
+        `--${foreground} must have 4.5:1 contrast on --${background}`,
+      );
+    }
+  }
+});
+
 test("observer serves deterministic, paginated and redacted evidence over real HTTP", async (t) => {
   const fixtureRoot = await mkdtemp(join(tmpdir(), "anu-observer-"));
   t.after(() => rm(fixtureRoot, { recursive: true, force: true }));
@@ -55,7 +110,7 @@ test("observer serves deterministic, paginated and redacted evidence over real H
     },
     { schemaVersion: 1, runId: "zeta-run", ticks: 10, events: 2 },
   );
-  await writeRun(
+  const alphaRunDirectory = await writeRun(
     dataDir,
     "runs/genesis-1/U0001",
     {
@@ -82,6 +137,30 @@ test("observer serves deterministic, paginated and redacted evidence over real H
       { seq: 4, type: "run.completed", data: { note: "password=hunter2" } },
     ],
   );
+  await writeFile(
+    join(alphaRunDirectory, "metrics.jsonl"),
+    [
+      {
+        schemaVersion: 1,
+        tick: 10,
+        taskSuccessRatePpm: 500_000,
+        meanQualityPpm: 750_000,
+        densityPpm: 100_000,
+        activeAgents: 16,
+        activeLinks: 12,
+      },
+      {
+        schemaVersion: 1,
+        tick: 20,
+        taskSuccessRatePpm: 800_000,
+        meanQualityPpm: 900_000,
+        densityPpm: 240_000,
+        activeAgents: 15,
+        activeLinks: 24,
+      },
+    ].map((metric) => canonicalJson(metric)).join("\n") + "\n",
+    "utf8",
+  );
   await writeRun(
     dataDir,
     "runs/genesis-1/U0001/run:addressed",
@@ -100,7 +179,28 @@ test("observer serves deterministic, paginated and redacted evidence over real H
 
   const rootResponse = await fetch(`${baseUrl}/`);
   assert.equal(rootResponse.status, 200);
-  assert.deepEqual((await rootResponse.json()).links, {
+  assert.match(rootResponse.headers.get("content-type") ?? "", /^text\/html/);
+  assert.match(rootResponse.headers.get("content-security-policy") ?? "", /script-src 'self'/);
+  const rootHtml = await rootResponse.text();
+  assert.match(rootHtml, /<main class="workspace"/);
+  assert.match(rootHtml, /ANU Observer/);
+  assert.doesNotMatch(rootHtml, /<script(?![^>]*\bsrc=)/);
+
+  const stylesheetResponse = await fetch(`${baseUrl}/assets/observer.css`);
+  assert.equal(stylesheetResponse.status, 200);
+  assert.match(stylesheetResponse.headers.get("content-type") ?? "", /^text\/css/);
+  assert.match(await stylesheetResponse.text(), /prefers-reduced-motion/);
+  const scriptResponse = await fetch(`${baseUrl}/assets/observer.js`);
+  assert.equal(scriptResponse.status, 200);
+  assert.match(scriptResponse.headers.get("content-type") ?? "", /^text\/javascript/);
+  assert.match(await scriptResponse.text(), /Bearer token/);
+
+  const serviceResponse = await fetch(`${baseUrl}/api`);
+  assert.equal(serviceResponse.status, 200);
+  const service = await serviceResponse.json();
+  assert.equal(service.version, "1.0.0");
+  assert.deepEqual(service.links, {
+    ui: "/",
     health: "/healthz",
     readiness: "/readyz",
     runs: "/api/runs",
@@ -140,6 +240,33 @@ test("observer serves deterministic, paginated and redacted evidence over real H
   assert.equal(detail.manifest.authToken, "[REDACTED]");
   assert.equal(detail.summary.credentials, "[REDACTED]");
   assert.equal(detail.summary.csrfToken, "[REDACTED]");
+
+  const metricsResponse = await fetch(`${baseUrl}/api/runs/alpha-run/metrics`);
+  assert.equal(metricsResponse.status, 200);
+  assert.deepEqual(await metricsResponse.json(), {
+    runId: "alpha-run",
+    count: 2,
+    metrics: [
+      {
+        schemaVersion: 1,
+        tick: 10,
+        taskSuccessRatePpm: 500_000,
+        meanQualityPpm: 750_000,
+        densityPpm: 100_000,
+        activeAgents: 16,
+        activeLinks: 12,
+      },
+      {
+        schemaVersion: 1,
+        tick: 20,
+        taskSuccessRatePpm: 800_000,
+        meanQualityPpm: 900_000,
+        densityPpm: 240_000,
+        activeAgents: 15,
+        activeLinks: 24,
+      },
+    ],
+  });
 
   const firstPageResponse = await fetch(`${baseUrl}/api/runs/alpha-run/events?after=1&limit=2`);
   assert.equal(firstPageResponse.status, 200);
@@ -195,6 +322,8 @@ test("observer rejects writes, traversal and unsafe or unbounded queries", async
   assert.equal(duplicateCursor.status, 400);
   const unknownQuery = await fetch(`${baseUrl}/api/runs/safe-run/events?path=/etc/passwd`);
   assert.equal(unknownQuery.status, 400);
+  const metricsQuery = await fetch(`${baseUrl}/api/runs/safe-run/metrics?limit=1`);
+  assert.equal(metricsQuery.status, 400);
 });
 
 test("observer never selects one of two evidence directories with the same run id", async (t) => {

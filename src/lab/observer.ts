@@ -9,11 +9,17 @@ import {
   type ServerResponse,
 } from "node:http";
 import { join, relative, resolve, sep } from "node:path";
-import { compareCodeUnits } from "./canonical.js";
+import { canonicalJson, compareCodeUnits } from "./canonical.js";
 import { validateRunEvidenceAttestation } from "./evidence-attestation-schema.js";
 import { openRegularFileNoFollow } from "./event-stream.js";
 import { MAX_LAB_EVENT_BYTES } from "./events.js";
+import {
+  OBSERVER_UI_ASSETS,
+  OBSERVER_UI_HTML,
+  type ObserverUiAsset,
+} from "./observer-ui.js";
 import type { RunEvidenceAttestation } from "./types.js";
+import { ANU_VERSION } from "../version.js";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 8787;
@@ -24,6 +30,7 @@ const MAX_SCAN_DEPTH = 8;
 const MAX_SCAN_ENTRIES = 20_000;
 const MAX_RUNS = 1_000;
 const MAX_JSON_ARTIFACT_BYTES = 1_048_576;
+const MAX_OBSERVER_METRICS_BYTES = 8_388_608;
 const MAX_EVENT_SCAN_BYTES = 67_108_864;
 const MAX_EVENT_RESPONSE_BYTES = 4_194_304;
 const MAX_EVENT_INDEX_RUNS = 64;
@@ -330,10 +337,26 @@ async function handleRequest(
   }
 
   if (url.pathname === "/") {
+    ensureNoQuery(url);
+    sendText(response, 200, OBSERVER_UI_HTML, "text/html; charset=utf-8");
+    return;
+  }
+
+  const uiAsset = OBSERVER_UI_ASSETS[url.pathname];
+  if (uiAsset !== undefined) {
+    ensureNoQuery(url);
+    sendUiAsset(response, uiAsset);
+    return;
+  }
+
+  if (url.pathname === "/api") {
+    ensureNoQuery(url);
     sendJson(response, 200, {
       service: "agent-native-universe-observer",
+      version: ANU_VERSION,
       status: "read-only",
       links: {
+        ui: "/",
         health: "/healthz",
         readiness: "/readyz",
         runs: "/api/runs",
@@ -377,6 +400,23 @@ async function handleRequest(
       count: runs.length,
       runs,
       truncated: false,
+    });
+    return;
+  }
+
+  const metricsMatch = /^\/api\/runs\/([^/]+)\/metrics$/.exec(url.pathname);
+  if (metricsMatch !== null) {
+    if (!authorizeEvidenceRequest(request, response, authHeaderDigest)) return;
+    ensureNoQuery(url);
+    const runId = decodeRunId(metricsMatch[1]);
+    const root = await resolveDataRootOr503(configuredDataDir);
+    const record = await findRun(root, runId);
+    if (record === undefined) throw new ObserverHttpError(404, "run_not_found");
+    const metrics = await readMetricSeries(record.directory, root);
+    sendJson(response, 200, {
+      runId,
+      count: metrics.length,
+      metrics,
     });
     return;
   }
@@ -461,14 +501,40 @@ function authorizeEvidenceRequest(
 
 function sendJson(response: ServerResponse, status: number, value: unknown): void {
   const body = JSON.stringify(redactEvidence(value));
+  sendText(response, status, body, "application/json; charset=utf-8", "default-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+}
+
+function sendUiAsset(response: ServerResponse, asset: ObserverUiAsset): void {
+  sendText(response, 200, asset.body, asset.contentType);
+}
+
+function sendText(
+  response: ServerResponse,
+  status: number,
+  body: string,
+  contentType: string,
+  contentSecurityPolicy = [
+    "default-src 'none'",
+    "base-uri 'none'",
+    "connect-src 'self'",
+    "font-src 'self'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+    "img-src 'self' data:",
+    "script-src 'self'",
+    "style-src 'self'",
+  ].join("; "),
+): void {
   response.statusCode = status;
-  response.setHeader("Content-Type", "application/json; charset=utf-8");
+  response.setHeader("Content-Type", contentType);
   response.setHeader("Content-Length", Buffer.byteLength(body, "utf8"));
   response.setHeader("Cache-Control", "no-store");
-  response.setHeader("Content-Security-Policy", "default-src 'none'; base-uri 'none'; frame-ancestors 'none'");
+  response.setHeader("Content-Security-Policy", contentSecurityPolicy);
+  response.setHeader("Cross-Origin-Opener-Policy", "same-origin");
   response.setHeader("Cross-Origin-Resource-Policy", "same-origin");
   response.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
   response.setHeader("Referrer-Policy", "no-referrer");
+  response.setHeader("X-DNS-Prefetch-Control", "off");
   response.setHeader("X-Content-Type-Options", "nosniff");
   response.setHeader("X-Frame-Options", "DENY");
   response.end(body);
@@ -683,6 +749,50 @@ async function readOptionalJsonArtifact(
     if (isMissingFile(error)) return null;
     throw error;
   }
+}
+
+async function readMetricSeries(
+  directory: string,
+  root: string,
+): Promise<Record<string, unknown>[]> {
+  let text: string;
+  try {
+    text = await readBoundedFile(directory, "metrics.jsonl", root, MAX_OBSERVER_METRICS_BYTES);
+  } catch (error) {
+    if (isMissingFile(error)) return [];
+    throw error;
+  }
+  if (text.length === 0) return [];
+  if (!text.endsWith("\n") || text.includes("\r")) {
+    throw new ObserverHttpError(422, "invalid_metrics");
+  }
+
+  const lines = text.slice(0, -1).split("\n");
+  const metrics: Record<string, unknown>[] = [];
+  let priorTick = -1;
+  for (const line of lines) {
+    if (line.length === 0 || Buffer.byteLength(line, "utf8") > MAX_JSON_ARTIFACT_BYTES) {
+      throw new ObserverHttpError(422, "invalid_metrics");
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line) as unknown;
+    } catch {
+      throw new ObserverHttpError(422, "invalid_metrics");
+    }
+    if (
+      !isJsonObject(parsed)
+      || !Number.isSafeInteger(parsed.tick)
+      || (parsed.tick as number) < 0
+      || (parsed.tick as number) <= priorTick
+      || canonicalJson(parsed as never) !== line
+    ) {
+      throw new ObserverHttpError(422, "invalid_metrics");
+    }
+    priorTick = parsed.tick as number;
+    metrics.push(parsed);
+  }
+  return metrics;
 }
 
 async function readOptionalAttestationArtifact(

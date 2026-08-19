@@ -26,6 +26,15 @@ function parseSingleJson(text) {
 }
 
 test("anu lab delegates to the strict structured runner without changing existing commands", () => {
+  for (const flag of ["--version", "-v", "version"]) {
+    const version = invoke("dist/cli/index.js", [flag]);
+    assert.equal(version.status, 0, version.stderr);
+    assert.equal(version.stdout, "1.0.0\n");
+  }
+  const rootHelp = invoke("dist/cli/index.js", ["--help"]);
+  assert.equal(rootHelp.status, 0, rootHelp.stderr);
+  assert.match(rootHelp.stdout, /\bv1\.0\.0\b/);
+
   const help = invoke("dist/cli/index.js", ["lab", "--help"]);
   assert.equal(help.status, 0, help.stderr);
   assert.equal(parseSingleJson(help.stdout).status, "ok");

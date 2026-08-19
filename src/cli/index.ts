@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 import { runLabCli } from "../lab/runner.js";
 import { Universe } from "../runtime/universe.js";
+import { ANU_VERSION } from "../version.js";
 
 const objective = (primary: string) => ({ primary, secondary: [], antiGoals: [], weights: {} });
 
 export async function runCli(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
   const [command, ...commandArguments] = argv;
 
-  if (!command || command === "help") {
-    console.log(`Agent Native Universe (anu)
+  if (!command || command === "help" || command === "--help" || command === "-h") {
+    console.log(`Agent Native Universe (anu) v${ANU_VERSION}
 
 Commands:
   anu demo         run a manually connected two-agent demo
@@ -16,6 +17,11 @@ Commands:
   anu living-demo  alias for anu living
   anu principles   print core runtime laws
   anu lab          run, replay, or observe Universe Lab experiments`);
+    return 0;
+  }
+
+  if (command === "version" || command === "--version" || command === "-v") {
+    console.log(ANU_VERSION);
     return 0;
   }
 

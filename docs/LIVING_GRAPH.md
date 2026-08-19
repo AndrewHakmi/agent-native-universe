@@ -80,6 +80,10 @@ This means the graph continuously removes relationships that no longer justify t
 
 A failed projection or protocol decision is recorded against the local agent/link. Other independent links continue to advance. One local world cannot crash the entire topology round.
 
-## Current scope
+## Layer scope
 
-The current implementation is deterministic and in-process. It proves the semantics of living topology but does not yet provide distributed consensus, remote transport, Byzantine fault tolerance or cryptographic identity.
+The local living-graph layer described here is deterministic and in-process. It
+defines the topology semantics without requiring a network. ANU's higher layers
+add authenticated remote transport, cryptographic identity, and network
+Byzantine agreement; see `docs/AUTONOMOUS_MESH.md`, `docs/MULTI_MACHINE.md`, and
+`docs/NETWORK_BFT.md`.

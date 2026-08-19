@@ -3,6 +3,7 @@ dist/
 dist-test/
 *.log
 .DS_Store
+.superdesign/
 .anu-state/
 runs/
 .superdesign/tmp/

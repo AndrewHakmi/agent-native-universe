@@ -92,18 +92,63 @@ complete world snapshots; historical task arrays alone can exceed 287 MiB per
 universe. A 32-universe population can therefore exceed 20 GiB after events,
 checkpoints, summaries, and failed preserved runs are included.
 
+## Completed v1 reference-universe canary
+
+On 2026-08-19 the v1 release-candidate runtime completed one immutable
+reference universe from `experiments/genesis-1/config.json` on this host: Node.js
+22.14.0, 8 vCPUs, Intel Xeon Gold 6458Q. The measured command was:
+
+```bash
+node dist/lab/runner.js genesis-1 \
+  --config ./experiments/genesis-1/config.json \
+  --data-dir /tmp/anu-v1-canary \
+  --universe-id U0001
+```
+
+The interval from manifest creation through the atomically committed summary
+was 4,494.6 seconds. Evidence mtimes place live completion at 2,313.9 seconds;
+the mandatory full semantic replay, final hashing, summary, and attestation
+occupied the remaining 2,180.7 seconds. These are one-run wall-clock
+observations, not statistical throughput claims.
+
+Measured evidence and process facts:
+
+- 64 initial agents, 52 active agents at tick 10,000, and 115 active links in
+  one connected component;
+- 41,509 tasks, 131,372 canonical events, and zero recorded violations;
+- 69,931,927 event-log bytes and 47,738 metric-history bytes;
+- 100 complete checkpoints; the tick-10,000 checkpoint was 15,097,607 bytes;
+- 701,400,591 total run-directory bytes;
+- highest sampled `VmHWM` 780,500 kB (about 762 MiB), with no swap;
+- final event hash
+  `02bbf72e31cdf1e76634442aa39dc7a84c7bbddb8f823179d50b612da1447a68`;
+- final state hash
+  `a082072c9f2258f2dcdd0bbf6db86e158ea32e607679f6a04806e4b66431c137`;
+- attestation commitment
+  `sha256:29a9876c5d9e41268460a3badf41ffc0d7e312eb50ec03f04a1bafb364b375d9`.
+
+This closes the single-universe canary item. It also confirms the remaining
+bottlenecks: full checkpoints dominate disk, and authoritative replay consumes
+CPU time comparable to live execution as task history grows.
+
+A separate `verify-attestation` invocation then reopened one held five-artifact
+snapshot, repeated authoritative semantic replay, matched the externally
+supplied commitment above, and returned `status: verified`. Verification did
+not modify the run directory.
+
 ## Current conclusion
 
-The policy hot path is materially improved, but the complete
-`32 × 64 × 10,000` target remains unvalidated. Before declaring capacity:
+One `64 × 10,000` reference universe now completes with replay-equivalent,
+attested evidence. The complete `32 × 64 × 10,000` target remains unvalidated.
+Before declaring population capacity:
 
 1. eliminate full task-history scans in expiry/backlog maintenance;
 2. benchmark an anchored persistent event writer instead of open/write/close
    for every event;
 3. replace full-world checkpoints with a lower-amplification representation;
 4. profile process-worker CPU, RSS, IPC, and evidence-writer contention;
-5. run one 64-agent × 10,000-tick canary with disk and RSS telemetry;
-6. only then scale the same immutable config to 32 universes.
+5. scale the same immutable config through guarded multi-universe stages before
+   attempting all 32 universes.
 
 Tick-boundary pause/resume is now durable: a checkpoint includes deterministic
 task-generator and neutral-policy RNG state, and resume requires independent

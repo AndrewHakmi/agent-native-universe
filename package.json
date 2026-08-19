@@ -1,6 +1,6 @@
 {
   "name": "agent-native-universe",
-  "version": "0.3.0",
+  "version": "1.0.0",
   "description": "An autonomous distributed agent-native runtime with encrypted peer discovery, network BFT, durable resource markets, metered LLM cognition and continuous fractal metaagents.",
   "type": "module",
   "main": "./dist/index.js",
@@ -32,6 +32,8 @@
     "experiments",
     "scripts",
     "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
     "LICENSE"
   ],
   "scripts": {
@@ -42,6 +44,7 @@
     "lab": "npm run build && node dist/lab/runner.js",
     "lab:capacity-profile": "npm run build && node --expose-gc scripts/lab-capacity-profile.mjs",
     "check": "npm run build && npm test",
+    "release:verify": "npm run check && npm run demo:living && npm pack --dry-run",
     "demo:living": "npm run build && node dist/examples/living-network.js"
   },
   "engines": {
@@ -50,6 +53,10 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/AndrewHakmi/agent-native-universe.git"
+  },
+  "homepage": "https://github.com/AndrewHakmi/agent-native-universe#readme",
+  "bugs": {
+    "url": "https://github.com/AndrewHakmi/agent-native-universe/issues"
   },
   "keywords": [
     "agents",
